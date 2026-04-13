@@ -294,9 +294,10 @@ def build_mask(h: int, w: int, crop: dict) -> np.ndarray:
 def apply_crop(image: np.ndarray, depth: np.ndarray, crop: dict):
     """
     Crop image and depth to the bounding box of the crop region.
-    Depth values are left exactly as they were — no scaling or zeroing inside
-    the crop shape.  Outside pixels are zeroed only so the STL builder knows
-    where the boundary is.
+    Depth values are left exactly as they were in the full image — no scaling
+    or zeroing anywhere.  The returned mask tells downstream code (STL builder)
+    which pixels are inside the crop shape; everything else keeps its original
+    depth so that visualisations show natural values at the crop boundary.
     Returns (cropped_image, cropped_depth, crop_mask_local, bbox).
     """
     H, W      = depth.shape
@@ -311,9 +312,9 @@ def apply_crop(image: np.ndarray, depth: np.ndarray, crop: dict):
     cropped_image = image[r0:r1+1, c0:c1+1].copy()
     cropped_mask  = mask_full[r0:r1+1, c0:c1+1]
 
-    # Zero out pixels outside the shape so they become base level in STL,
-    # but the depth values inside the shape are untouched originals.
-    cropped_depth[~cropped_mask] = 0.0
+    # Depth values are preserved everywhere (inside and outside the crop shape)
+    # so that all visualisations show the natural depth at the crop boundary.
+    # The STL builder uses crop_mask directly to set outside pixels to base_mm.
 
     return cropped_image, cropped_depth, cropped_mask, (r0, r1, c0, c1)
 
@@ -479,17 +480,17 @@ def depth_to_stl_z(depth_map: np.ndarray, dz: float, base_mm: float,
     """
     Convert a normalised depth map to z-heights for the STL top surface.
 
-    The depth map from renorm_depth() has 0 = close, 1 = far.
+    The depth map from renorm_depth() encodes larger values for closer pixels.
     For a convex object (protrudes toward camera), closer pixels should be
-    HIGHER in z, so we invert: z = (1 - depth) * dz.
+    HIGHER in z, so z is mapped directly: z = depth_map * dz.
 
     Steps:
-      1. Invert: z = (1 - depth_map) * dz  -> close pixels get high z.
+      1. Scale: z = depth_map * dz  -> close pixels (high depth) get high z.
       2. Shift so the minimum z over the in-mask region = base_mm
          (ensures no zero-thickness print and correct floor level).
       3. Outside mask pixels are set to base_mm (flat floor, does not protrude).
     """
-    z = (1.0 - depth_map) * dz
+    z = depth_map * dz
 
     # Compute floor shift only over the region that matters (inside mask).
     if mask is not None:
@@ -623,9 +624,11 @@ def save_contour(depth: np.ndarray, path: str, levels: int = 150):
 
 def save_contour_3d_html(depth: np.ndarray, path: str, step: int = 4):
     """
-    Export an interactive, orbiteable 3-D surface plot as a self-contained HTML
-    file using Plotly.  'step' downsamples the depth map so the file stays
-    manageable (step=4 -> uses every 4th pixel in x and y).
+    Export an interactive, orbiteable 3-D surface plot with contour lines as a
+    self-contained HTML file using Plotly.  Contour lines are drawn directly on
+    the surface so the plot acts as both a depth surface and a contour map.
+    'step' downsamples the depth map so the file stays manageable
+    (step=4 -> uses every 4th pixel in x and y).
     """
     d = depth[::step, ::step]
     H, W = d.shape
@@ -639,10 +642,19 @@ def save_contour_3d_html(depth: np.ndarray, path: str, step: int = 4):
         colorscale="Viridis",
         colorbar=dict(title="Depth"),
         lighting=dict(ambient=0.6, diffuse=0.8, specular=0.3),
+        contours=dict(
+            z=dict(
+                show=True,
+                usecolormap=True,
+                highlightcolor="white",
+                project_z=False,
+                width=2,
+            )
+        ),
     )])
 
     fig.update_layout(
-        title="Depth Map - Interactive 3D Surface",
+        title="Depth Map - Interactive 3D Contour Surface (orbit with mouse)",
         scene=dict(
             xaxis_title="X (px)",
             yaxis_title="Y (px)",
@@ -728,7 +740,7 @@ def run():
     print("Running inference ...")
     raw_depth = model.infer_image(bgr_frame)
     depth     = renorm_depth(raw_depth, invert=INVERT_DEPTH)
-    # depth is now [0=close, 1=far]
+    # depth is now normalised to [0, 1]; closer pixels have larger values.
 
     # ── Apply crop ────────────────────────────────────────────────────────────
     if crop:
@@ -740,7 +752,8 @@ def run():
         crop_mask  = None
 
     # ── PLY mesh (visualisation) ──────────────────────────────────────────────
-    # PLY inverts depth (max - depth) so that closer = lower depth value = higher z.
+    # PLY inverts depth (max - depth) so far pixels (low depth) become high z,
+    # giving the correct 3-D shape when orbited in a PLY viewer from any angle.
     print("\nBuilding PLY mesh ...")
     ply_depth = np.flipud(np.max(depth_work) - depth_work)
     ply_rgb   = np.flipud(rgb_work)
@@ -750,8 +763,8 @@ def run():
     print(f"  Saved PLY mesh    -> {ply_path}")
 
     # ── STL solid ─────────────────────────────────────────────────────────────
-    # depth_work: 0=close, 1=far. depth_to_stl_z() inverts so closer = higher z
-    # = convex protrusion.
+    # depth_work: larger values = closer. depth_to_stl_z() maps high depth ->
+    # high z so the close/near region protrudes upward (convex relief).
     print("Building STL solid ...")
     stl_tris = build_solid_stl(depth_work, dz=DZ_SCALE,
                                base_mm=STL_BASE_MM, mask=crop_mask)
