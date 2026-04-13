@@ -49,14 +49,15 @@ INVERT_DEPTH = False     # True -> closer = brighter in heatmap/PLY
 
 # Physical scale — computed from the full image BEFORE any crop is applied.
 # FOV_DIAGONAL_DEG : diagonal field of view of the camera/sensor in degrees.
-# FOV_DISTANCE_MM  : distance (mm) at which that FOV is measured.
-# Together these determine how many mm each pixel represents.
-# Example: 90° diagonal FOV, 100 mm distance → scene diagonal ≈ 200 mm.
+# MAX_Z_MM         : maximum depth of the scene in mm (also used as the working
+#                    distance for the FOV geometry, so it determines how many mm
+#                    each pixel represents in x/y as well as the z relief scale).
+# Together: pixel_size_mm = 2*MAX_Z_MM*tan(FOV/2) / sqrt(W^2+H^2)
 FOV_DIAGONAL_DEG = 90.0   # degrees  — diagonal field of view
-FOV_DISTANCE_MM  = 100.0  # mm       — working distance
 
-# Maximum z-height (depth relief) of the 3-D outputs, in mm.
-MAX_Z_MM     = 20.0        # mm  — tallest point of the relief surface
+# Maximum z-height of the scene / 3-D outputs, in mm.
+# This doubles as the working distance for the FOV → mm/px calculation.
+MAX_Z_MM     = 20.0        # mm  — scene depth & tallest point of the relief
 
 STL_BASE_MM  = 1.0         # mm  — flat base thickness below the deepest point
 # ─────────────────────────────────────────────────────────────────────────────
@@ -405,12 +406,13 @@ def load_crop(path: str) -> dict | None:
 # ══════════════════════════════════════════════════════════════════════════════
 def compute_pixel_size_mm(W: int, H: int,
                           fov_diagonal_deg: float,
-                          distance_mm: float) -> float:
+                          max_z_mm: float) -> float:
     """
     Return the physical size of one pixel in mm.
 
-    The diagonal FOV of the sensor covers a physical span of
-        physical_diagonal_mm = 2 * distance_mm * tan(fov_diagonal_deg / 2)
+    MAX_Z_MM is treated as both the scene depth and the working distance for
+    the FOV geometry.  At that distance the diagonal FOV covers:
+        physical_diagonal_mm = 2 * max_z_mm * tan(fov_diagonal_deg / 2)
     spread across sqrt(W^2 + H^2) pixels, giving:
         pixel_size_mm = physical_diagonal_mm / sqrt(W^2 + H^2)
 
@@ -419,7 +421,7 @@ def compute_pixel_size_mm(W: int, H: int,
     """
     import math
     half_angle_rad    = math.radians(fov_diagonal_deg / 2.0)
-    phys_diagonal_mm  = 2.0 * distance_mm * math.tan(half_angle_rad)
+    phys_diagonal_mm  = 2.0 * max_z_mm * math.tan(half_angle_rad)
     pixel_diagonal_px = math.sqrt(W ** 2 + H ** 2)
     return phys_diagonal_mm / pixel_diagonal_px
 
@@ -739,11 +741,13 @@ def run():
     print(f"Image loaded: {rgb_frame.shape[1]} x {rgb_frame.shape[0]} px")
 
     # Compute physical pixel size from the FULL image before any crop is applied.
+    # MAX_Z_MM is used as the working distance: at that depth the scene diagonal
+    # spans  2*MAX_Z_MM*tan(FOV/2) mm, which sets the mm/pixel ratio.
     full_H, full_W = rgb_frame.shape[:2]
     pixel_size_mm  = compute_pixel_size_mm(full_W, full_H,
-                                           FOV_DIAGONAL_DEG, FOV_DISTANCE_MM)
+                                           FOV_DIAGONAL_DEG, MAX_Z_MM)
     print(f"  Pixel size        : {pixel_size_mm:.4f} mm/px  "
-          f"(FOV {FOV_DIAGONAL_DEG}° diag @ {FOV_DISTANCE_MM} mm  →  "
+          f"(FOV {FOV_DIAGONAL_DEG}° diag, max-z {MAX_Z_MM} mm  →  "
           f"{full_W * pixel_size_mm:.1f} x {full_H * pixel_size_mm:.1f} mm scene)")
 
     # ── Crop selection ────────────────────────────────────────────────────────
