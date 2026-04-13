@@ -479,18 +479,25 @@ def depth_to_stl_z(depth_map: np.ndarray, dz: float, base_mm: float,
     """
     Convert a normalised depth map to z-heights for the STL top surface.
 
-    The depth map from renorm_depth() has 0 = far, 1 = close.
+    The depth map from renorm_depth() has 0 = close, 1 = far.
     For a convex object (protrudes toward camera), closer pixels should be
-    HIGHER in z, so we use depth directly (not inverted).
+    HIGHER in z, so we invert: z = (1 - depth) * dz.
 
     Steps:
-      1. depth_map is already [0=far, 1=close] after renorm_depth().
-      2. Scale by dz.
-      3. Shift so the minimum z = base_mm (ensures no zero-thickness print).
-      4. Outside mask pixels are set to base_mm (flat floor, does not protrude).
+      1. Invert: z = (1 - depth_map) * dz  -> close pixels get high z.
+      2. Shift so the minimum z over the in-mask region = base_mm
+         (ensures no zero-thickness print and correct floor level).
+      3. Outside mask pixels are set to base_mm (flat floor, does not protrude).
     """
-    z = depth_map * dz
-    z = z - z.min() + base_mm   # minimum pixel = base_mm above bed
+    z = (1.0 - depth_map) * dz
+
+    # Compute floor shift only over the region that matters (inside mask).
+    if mask is not None:
+        z_min = z[mask].min() if mask.any() else 0.0
+    else:
+        z_min = z.min()
+
+    z = z - z_min + base_mm
 
     if mask is not None:
         z[~mask] = base_mm       # outside crop -> flat floor, not a peak
@@ -721,7 +728,7 @@ def run():
     print("Running inference ...")
     raw_depth = model.infer_image(bgr_frame)
     depth     = renorm_depth(raw_depth, invert=INVERT_DEPTH)
-    # depth is now [0=far, 1=close]
+    # depth is now [0=close, 1=far]
 
     # ── Apply crop ────────────────────────────────────────────────────────────
     if crop:
@@ -733,7 +740,7 @@ def run():
         crop_mask  = None
 
     # ── PLY mesh (visualisation) ──────────────────────────────────────────────
-    # PLY uses max-depth to flip so that closer = higher z (same as STL convention)
+    # PLY inverts depth (max - depth) so that closer = lower depth value = higher z.
     print("\nBuilding PLY mesh ...")
     ply_depth = np.flipud(np.max(depth_work) - depth_work)
     ply_rgb   = np.flipud(rgb_work)
@@ -743,8 +750,8 @@ def run():
     print(f"  Saved PLY mesh    -> {ply_path}")
 
     # ── STL solid ─────────────────────────────────────────────────────────────
-    # depth_work: 0=far, 1=close. Closer pixels = higher z = convex protrusion.
-    # depth_to_stl_z() uses depth directly (no inversion needed here).
+    # depth_work: 0=close, 1=far. depth_to_stl_z() inverts so closer = higher z
+    # = convex protrusion.
     print("Building STL solid ...")
     stl_tris = build_solid_stl(depth_work, dz=DZ_SCALE,
                                base_mm=STL_BASE_MM, mask=crop_mask)
