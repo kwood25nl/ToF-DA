@@ -478,11 +478,11 @@ def build_ply_mesh(depth_map: np.ndarray,
 def depth_to_stl_z(depth_map: np.ndarray, dz: float, base_mm: float,
                    mask: np.ndarray | None = None) -> np.ndarray:
     """
-    Convert a normalised depth map to z-heights for the STL top surface.
+    Convert a display depth map to z-heights for the STL top surface.
 
-    The depth map from renorm_depth() encodes larger values for closer pixels.
-    For a convex object (protrudes toward camera), closer pixels should be
-    HIGHER in z, so z is mapped directly: z = depth_map * dz.
+    Input convention (depth_display): close pixels = HIGH values, far = LOW.
+    This matches how the PLY is built, so the STL relief is convex (close
+    objects protrude upward) rather than concave.
 
     Steps:
       1. Scale: z = depth_map * dz  -> close pixels (high depth) get high z.
@@ -740,7 +740,7 @@ def run():
     print("Running inference ...")
     raw_depth = model.infer_image(bgr_frame)
     depth     = renorm_depth(raw_depth, invert=INVERT_DEPTH)
-    # depth is now normalised to [0, 1]; closer pixels have larger values.
+    # depth is now normalised to [0, 1]; with INVERT_DEPTH=False, close=0, far=1.
 
     # ── Apply crop ────────────────────────────────────────────────────────────
     if crop:
@@ -751,11 +751,16 @@ def run():
         depth_work = depth
         crop_mask  = None
 
+    # depth_display: invert so close pixels = high values (protrude / convex).
+    # renorm_depth() with INVERT_DEPTH=False gives close=0, far=1, so we flip.
+    # All 3-D outputs (PLY, STL, HTML) share this same convention.
+    depth_display = np.max(depth_work) - depth_work
+
     # ── PLY mesh (visualisation) ──────────────────────────────────────────────
-    # PLY inverts depth (max - depth) so far pixels (low depth) become high z,
-    # giving the correct 3-D shape when orbited in a PLY viewer from any angle.
+    # PLY needs a vertical flip for OpenGL-style y-axis; depth convention is
+    # already correct via depth_display.
     print("\nBuilding PLY mesh ...")
-    ply_depth = np.flipud(np.max(depth_work) - depth_work)
+    ply_depth = np.flipud(depth_display)
     ply_rgb   = np.flipud(rgb_work)
     ply_mesh  = build_ply_mesh(ply_depth, rgb_image=ply_rgb, dz=DZ_SCALE)
     ply_path  = os.path.join(save_folder, "Object_Mesh.ply")
@@ -763,10 +768,10 @@ def run():
     print(f"  Saved PLY mesh    -> {ply_path}")
 
     # ── STL solid ─────────────────────────────────────────────────────────────
-    # depth_work: larger values = closer. depth_to_stl_z() maps high depth ->
-    # high z so the close/near region protrudes upward (convex relief).
+    # depth_display: close = high. depth_to_stl_z() maps high -> high z so the
+    # near region protrudes upward (convex relief) as expected.
     print("Building STL solid ...")
-    stl_tris = build_solid_stl(depth_work, dz=DZ_SCALE,
+    stl_tris = build_solid_stl(depth_display, dz=DZ_SCALE,
                                base_mm=STL_BASE_MM, mask=crop_mask)
     stl_path = os.path.join(save_folder, "Object_Solid.stl")
     write_stl(stl_tris, stl_path)
@@ -777,7 +782,7 @@ def run():
                  os.path.join(save_folder, "Depth_Map_Heatmap.png"))
     save_contour(depth_work,
                  os.path.join(save_folder, "Depth_Map_Contour.png"))
-    save_contour_3d_html(depth_work,
+    save_contour_3d_html(depth_display,
                          os.path.join(save_folder, "Depth_Map_Contour_3D.html"))
 
     print(f"\nAll done! Files saved to:\n  {save_folder}")
