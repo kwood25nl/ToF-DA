@@ -6,7 +6,8 @@ Outputs (in a timestamped subfolder of SAVE_ROOT):
   - Depth_Map_Contour.png
   - Depth_Map_Contour_3D.html   <- interactive, orbiteable in any browser
   - Object_Mesh.ply             (coloured, for visualisation)
-  - Object_Solid.stl            (solid, 3-D printable; 1 mm flat base + depth relief)
+  - Object_Solid.stl            (solid, 3-D printable; base + depth relief,
+                                  footprint = crop shape, smoothed edge taper)
   - crop_region.json            (saved crop path for this run)
   - crop_region_saved.json      (persistent across runs, in SAVE_ROOT)
   - crop_description.txt        (mathematical description for reports)
@@ -47,8 +48,20 @@ ENCODER      = "vitl"    # "vits" | "vitb" | "vitl"
 INDOOR_MODE  = False     # True = metric metres, False = relative depth
 INVERT_DEPTH = False     # True -> closer = brighter in heatmap/PLY
 
-DZ_SCALE     = 150       # Depth relief scale applied to normalised [0-1] depth
-STL_BASE_MM  = 1.0       # Flat base thickness below the deepest point
+# Physical scale — computed from the full image BEFORE any crop is applied.
+# FOV_DIAGONAL_DEG : diagonal field of view of the camera/sensor in degrees.
+# MAX_Z_MM         : maximum depth of the scene in mm (also used as the working
+#                    distance for the FOV geometry, so it determines how many mm
+#                    each pixel represents in x/y as well as the z relief scale).
+# Together: pixel_size_mm = 2*MAX_Z_MM*tan(FOV/2) / sqrt(W^2+H^2)
+FOV_DIAGONAL_DEG = 90.0   # degrees  — diagonal field of view
+
+# Maximum z-height of the scene / 3-D outputs, in mm.
+# This doubles as the working distance for the FOV → mm/px calculation.
+MAX_Z_MM     = 20.0        # mm  — scene depth & tallest point of the relief
+
+STL_BASE_MM       = 1.0    # mm  — flat base thickness below the deepest point
+STL_EDGE_SMOOTH_PX = 3    # px  — smoothstep taper width at the crop boundary
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -294,9 +307,10 @@ def build_mask(h: int, w: int, crop: dict) -> np.ndarray:
 def apply_crop(image: np.ndarray, depth: np.ndarray, crop: dict):
     """
     Crop image and depth to the bounding box of the crop region.
-    Depth values are left exactly as they were — no scaling or zeroing inside
-    the crop shape.  Outside pixels are zeroed only so the STL builder knows
-    where the boundary is.
+    Depth values are left exactly as they were in the full image — no scaling
+    or zeroing anywhere.  The returned mask tells downstream code (STL builder)
+    which pixels are inside the crop shape; everything else keeps its original
+    depth so that visualisations show natural values at the crop boundary.
     Returns (cropped_image, cropped_depth, crop_mask_local, bbox).
     """
     H, W      = depth.shape
@@ -311,9 +325,9 @@ def apply_crop(image: np.ndarray, depth: np.ndarray, crop: dict):
     cropped_image = image[r0:r1+1, c0:c1+1].copy()
     cropped_mask  = mask_full[r0:r1+1, c0:c1+1]
 
-    # Zero out pixels outside the shape so they become base level in STL,
-    # but the depth values inside the shape are untouched originals.
-    cropped_depth[~cropped_mask] = 0.0
+    # Depth values are preserved everywhere (inside and outside the crop shape)
+    # so that all visualisations show the natural depth at the crop boundary.
+    # The STL builder uses crop_mask directly to set outside pixels to base_mm.
 
     return cropped_image, cropped_depth, cropped_mask, (r0, r1, c0, c1)
 
@@ -390,6 +404,31 @@ def load_crop(path: str) -> dict | None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  PHYSICAL SCALE
+# ══════════════════════════════════════════════════════════════════════════════
+def compute_pixel_size_mm(W: int, H: int,
+                          fov_diagonal_deg: float,
+                          max_z_mm: float) -> float:
+    """
+    Return the physical size of one pixel in mm.
+
+    MAX_Z_MM is treated as both the scene depth and the working distance for
+    the FOV geometry.  At that distance the diagonal FOV covers:
+        physical_diagonal_mm = 2 * max_z_mm * tan(fov_diagonal_deg / 2)
+    spread across sqrt(W^2 + H^2) pixels, giving:
+        pixel_size_mm = physical_diagonal_mm / sqrt(W^2 + H^2)
+
+    This is always computed from the FULL image dimensions so that the
+    physical scale is consistent regardless of which crop is applied later.
+    """
+    import math
+    half_angle_rad    = math.radians(fov_diagonal_deg / 2.0)
+    phys_diagonal_mm  = 2.0 * max_z_mm * math.tan(half_angle_rad)
+    pixel_diagonal_px = math.sqrt(W ** 2 + H ** 2)
+    return phys_diagonal_mm / pixel_diagonal_px
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  MODEL
 # ══════════════════════════════════════════════════════════════════════════════
 def load_model():
@@ -440,13 +479,14 @@ def renorm_depth(depth: np.ndarray, invert: bool = True) -> np.ndarray:
 def build_ply_mesh(depth_map: np.ndarray,
                    rgb_image: np.ndarray | None = None,
                    cmap_name: str = "gray",
-                   dz: float = 1.0) -> o3d.geometry.TriangleMesh:
+                   dz: float = 1.0,
+                   xy_scale: float = 1.0) -> o3d.geometry.TriangleMesh:
     H, W     = depth_map.shape
     scaled   = depth_map * dz
 
     jj, ii   = np.meshgrid(np.arange(W), np.arange(H))
-    vertices = np.column_stack([jj.ravel().astype(float),
-                                ii.ravel().astype(float),
+    vertices = np.column_stack([jj.ravel().astype(float) * xy_scale,
+                                ii.ravel().astype(float) * xy_scale,
                                 scaled.ravel().astype(float)])
 
     if rgb_image is not None:
@@ -477,19 +517,19 @@ def build_ply_mesh(depth_map: np.ndarray,
 def depth_to_stl_z(depth_map: np.ndarray, dz: float, base_mm: float,
                    mask: np.ndarray | None = None) -> np.ndarray:
     """
-    Convert a normalised depth map to z-heights for the STL top surface.
+    Convert a display depth map to z-heights for the STL top surface.
 
-    The depth map from renorm_depth() has 0 = close, 1 = far.
-    For a convex object (protrudes toward camera), closer pixels should be
-    HIGHER in z, so we invert: z = (1 - depth) * dz.
+    Input convention (depth_display): close pixels = HIGH values, far = LOW.
+    This matches how the PLY is built, so the STL relief is convex (close
+    objects protrude upward) rather than concave.
 
     Steps:
-      1. Invert: z = (1 - depth_map) * dz  -> close pixels get high z.
+      1. Scale: z = depth_map * dz  -> close pixels (high depth) get high z.
       2. Shift so the minimum z over the in-mask region = base_mm
          (ensures no zero-thickness print and correct floor level).
       3. Outside mask pixels are set to base_mm (flat floor, does not protrude).
     """
-    z = (1.0 - depth_map) * dz
+    z = depth_map * dz
 
     # Compute floor shift only over the region that matters (inside mask).
     if mask is not None:
@@ -508,10 +548,37 @@ def depth_to_stl_z(depth_map: np.ndarray, dz: float, base_mm: float,
 def build_solid_stl(depth_map: np.ndarray,
                     dz: float,
                     base_mm: float,
-                    mask: np.ndarray | None = None) -> list:
-    """Build a watertight solid. Top surface = depth relief, bottom = flat at z=0."""
+                    mask: np.ndarray | None = None,
+                    xy_scale: float = 1.0,
+                    edge_smooth_px: int = 3) -> list:
+    """Build a watertight solid whose footprint matches the mask (crop shape).
+
+    Changes vs. previous version
+    -----------------------------
+    * Base only in crop area: cells entirely outside the mask are skipped, so
+      the solid's base and perimeter follow the crop boundary, not the full
+      bounding-box rectangle.
+    * Smooth xy edges: a smoothstep taper (edge_smooth_px wide) fades z toward
+      base_mm at the crop boundary, removing the staircase cliff while leaving
+      all interior z values untouched.
+    * Perimeter walls follow the mask boundary: a wall quad is emitted on every
+      edge of an active cell that borders a non-active cell (or the grid edge).
+    """
+    from scipy.ndimage import distance_transform_edt
+
     H, W      = depth_map.shape
     z_surface = depth_to_stl_z(depth_map, dz, base_mm, mask)
+
+    # ── Edge smoothing ────────────────────────────────────────────────────────
+    # Ramp z toward base_mm within edge_smooth_px pixels of the mask boundary.
+    # Only inside-mask pixels are altered; interior z data is preserved.
+    if mask is not None and edge_smooth_px > 0:
+        dist = distance_transform_edt(mask)              # 0 at edge, + inward
+        t    = np.clip(dist / float(edge_smooth_px), 0.0, 1.0)
+        t    = t * t * (3.0 - 2.0 * t)                  # smoothstep
+        z_surface = np.where(mask,
+                             base_mm + (z_surface - base_mm) * t,
+                             z_surface)
 
     triangles = []
 
@@ -522,54 +589,78 @@ def build_solid_stl(depth_map: np.ndarray,
         n  = (n / ln) if ln > 0 else n
         triangles.append((n, a, b, c))
 
-    # Top surface
+    def vtop(r, c):
+        return np.array([c * xy_scale, r * xy_scale, z_surface[r, c]], dtype=float)
+
+    def vbot(r, c):
+        return np.array([c * xy_scale, r * xy_scale, 0.0], dtype=float)
+
+    # ── Active cells ──────────────────────────────────────────────────────────
+    # A cell (i,j) is active if at least one of its four corner pixels is inside
+    # the mask (or always active when there is no mask).
+    if mask is not None:
+        m          = mask.astype(np.uint8)
+        corner_sum = (m[:-1, :-1].astype(np.int32) + m[:-1, 1:]
+                      + m[1:, :-1] + m[1:, 1:])
+        active = corner_sum > 0                          # shape (H-1, W-1)
+    else:
+        active = np.ones((H - 1, W - 1), dtype=bool)
+
+    # Pad active with False so boundary lookups never go out of range.
+    # ap[i+1, j+1] == active[i, j]
+    ap = np.zeros((H + 1, W + 1), dtype=bool)
+    ap[1:H, 1:W] = active
+
+    # ── Top surface ───────────────────────────────────────────────────────────
     for i in range(H - 1):
         for j in range(W - 1):
-            p00 = np.array([j,   i,   z_surface[i,   j  ]], dtype=float)
-            p10 = np.array([j+1, i,   z_surface[i,   j+1]], dtype=float)
-            p01 = np.array([j,   i+1, z_surface[i+1, j  ]], dtype=float)
-            p11 = np.array([j+1, i+1, z_surface[i+1, j+1]], dtype=float)
-            tri(p00, p10, p01)
-            tri(p10, p11, p01)
+            if not active[i, j]:
+                continue
+            p00 = vtop(i,   j  );  p10 = vtop(i,   j+1)
+            p01 = vtop(i+1, j  );  p11 = vtop(i+1, j+1)
+            tri(p00, p10, p01);    tri(p10, p11, p01)
 
-    # Bottom face (z=0, reversed winding -> normal points down)
+    # ── Bottom face ───────────────────────────────────────────────────────────
     for i in range(H - 1):
         for j in range(W - 1):
-            b00 = np.array([j,   i,   0.0], dtype=float)
-            b10 = np.array([j+1, i,   0.0], dtype=float)
-            b01 = np.array([j,   i+1, 0.0], dtype=float)
-            b11 = np.array([j+1, i+1, 0.0], dtype=float)
-            tri(b00, b01, b10)
-            tri(b10, b01, b11)
+            if not active[i, j]:
+                continue
+            b00 = vbot(i,   j  );  b10 = vbot(i,   j+1)
+            b01 = vbot(i+1, j  );  b11 = vbot(i+1, j+1)
+            tri(b00, b01, b10);    tri(b10, b01, b11)
 
-    # Side walls
-    for i in range(H - 1):   # left (j=0)
-        t  = np.array([0, i,   z_surface[i,   0]], dtype=float)
-        b  = np.array([0, i,   0.0],               dtype=float)
-        tn = np.array([0, i+1, z_surface[i+1, 0]], dtype=float)
-        bn = np.array([0, i+1, 0.0],               dtype=float)
-        tri(t, b, tn);  tri(b, bn, tn)
+    # ── Perimeter walls ───────────────────────────────────────────────────────
+    # For each active cell, emit a wall quad on any edge that borders a
+    # non-active cell (or the grid boundary).  Winding is chosen so the
+    # computed normal points away from the solid (outward).
+    for i in range(H - 1):
+        for j in range(W - 1):
+            if not active[i, j]:
+                continue
 
-    for i in range(H - 1):   # right (j=W-1)
-        t  = np.array([W-1, i,   z_surface[i,   W-1]], dtype=float)
-        b  = np.array([W-1, i,   0.0],                 dtype=float)
-        tn = np.array([W-1, i+1, z_surface[i+1, W-1]], dtype=float)
-        bn = np.array([W-1, i+1, 0.0],                 dtype=float)
-        tri(t, tn, b);  tri(b, tn, bn)
+            # Top edge (grid row i): neighbour above → ap[i, j+1]
+            if not ap[i, j + 1]:
+                t0 = vtop(i, j);  t1 = vtop(i, j+1)
+                b0 = vbot(i, j);  b1 = vbot(i, j+1)
+                tri(t0, b0, t1);  tri(b0, b1, t1)        # normal -y
 
-    for j in range(W - 1):   # top edge (i=0)
-        t  = np.array([j,   0, z_surface[0, j  ]], dtype=float)
-        b  = np.array([j,   0, 0.0],               dtype=float)
-        tn = np.array([j+1, 0, z_surface[0, j+1]], dtype=float)
-        bn = np.array([j+1, 0, 0.0],               dtype=float)
-        tri(t, tn, b);  tri(b, tn, bn)
+            # Bottom edge (grid row i+1): neighbour below → ap[i+2, j+1]
+            if not ap[i + 2, j + 1]:
+                t0 = vtop(i+1, j);  t1 = vtop(i+1, j+1)
+                b0 = vbot(i+1, j);  b1 = vbot(i+1, j+1)
+                tri(t0, t1, b0);    tri(b0, t1, b1)       # normal +y
 
-    for j in range(W - 1):   # bottom edge (i=H-1)
-        t  = np.array([j,   H-1, z_surface[H-1, j  ]], dtype=float)
-        b  = np.array([j,   H-1, 0.0],                 dtype=float)
-        tn = np.array([j+1, H-1, z_surface[H-1, j+1]], dtype=float)
-        bn = np.array([j+1, H-1, 0.0],                 dtype=float)
-        tri(t, b, tn);  tri(b, bn, tn)
+            # Left edge (grid col j): neighbour left → ap[i+1, j]
+            if not ap[i + 1, j]:
+                t0 = vtop(i, j);  t1 = vtop(i+1, j)
+                b0 = vbot(i, j);  b1 = vbot(i+1, j)
+                tri(t0, t1, b0);  tri(b0, t1, b1)         # normal -x
+
+            # Right edge (grid col j+1): neighbour right → ap[i+1, j+2]
+            if not ap[i + 1, j + 2]:
+                t0 = vtop(i, j+1);  t1 = vtop(i+1, j+1)
+                b0 = vbot(i, j+1);  b1 = vbot(i+1, j+1)
+                tri(t0, b0, t1);    tri(b0, b1, t1)        # normal +x
 
     return triangles
 
@@ -602,9 +693,12 @@ def save_heatmap(depth: np.ndarray, path: str):
     print(f"  Saved heatmap     -> {path}")
 
 
-def save_contour(depth: np.ndarray, path: str, levels: int = 150):
+def save_contour(depth: np.ndarray, path: str, levels: int = 150,
+                 xy_scale: float = 1.0):
     H, W  = depth.shape
-    x, y  = np.meshgrid(np.arange(W), np.arange(H))
+    x = np.arange(W) * xy_scale
+    y = np.arange(H) * xy_scale
+    x, y  = np.meshgrid(x, y)
     dpos  = depth[depth > 0]
     if len(dpos) == 0:
         print("  Contour skipped (no positive depth values).")
@@ -615,40 +709,61 @@ def save_contour(depth: np.ndarray, path: str, levels: int = 150):
     c = ax.contour(x, y, depth, colors="black", levels=lvls, linewidths=0.8)
     plt.clabel(c, inline=True, fontsize=7, levels=c.levels[::2])
     ax.set_title("Depth Map - Contour")
+    ax.set_xlabel("X (mm)")
+    ax.set_ylabel("Y (mm)")
     ax.set_aspect("equal")
     fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved contour     -> {path}")
 
 
-def save_contour_3d_html(depth: np.ndarray, path: str, step: int = 4):
+def save_contour_3d_html(depth: np.ndarray, path: str, step: int = 4,
+                         dz: float = 1.0, xy_scale: float = 1.0):
     """
-    Export an interactive, orbiteable 3-D surface plot as a self-contained HTML
-    file using Plotly.  'step' downsamples the depth map so the file stays
-    manageable (step=4 -> uses every 4th pixel in x and y).
+    Export an interactive, orbiteable 3-D surface plot with contour lines as a
+    self-contained HTML file using Plotly.  Contour lines are drawn directly on
+    the surface so the plot acts as both a depth surface and a contour map.
+    'step' downsamples the depth map so the file stays manageable
+    (step=4 -> uses every 4th pixel in x and y).
+    x/y axes are in mm (xy_scale mm per pixel); z axis is in mm (dz applied).
     """
-    d = depth[::step, ::step]
+    d = depth[::step, ::step] * dz
     H, W = d.shape
-    x = np.arange(W) * step
-    y = np.arange(H) * step
+    x = np.arange(W) * step * xy_scale
+    y = np.arange(H) * step * xy_scale
+
+    x_range_mm = x[-1] if len(x) > 1 else 1.0
+    y_range_mm = y[-1] if len(y) > 1 else 1.0
+    xy_max     = max(x_range_mm, y_range_mm)
+    z_ratio    = (dz / xy_max) if xy_max > 0 else 0.4
 
     fig = go.Figure(data=[go.Surface(
         z=d,
         x=x,
         y=y,
         colorscale="Viridis",
-        colorbar=dict(title="Depth"),
+        colorbar=dict(title="Depth (mm)"),
         lighting=dict(ambient=0.6, diffuse=0.8, specular=0.3),
+        contours=dict(
+            z=dict(
+                show=True,
+                usecolormap=True,
+                highlightcolor="white",
+                project_z=False,
+                width=2,
+            )
+        ),
     )])
 
     fig.update_layout(
-        title="Depth Map - Interactive 3D Surface",
+        title="Depth Map - Interactive 3D Contour Surface (orbit with mouse)",
         scene=dict(
-            xaxis_title="X (px)",
-            yaxis_title="Y (px)",
-            zaxis_title="Depth",
+            xaxis_title="X (mm)",
+            yaxis_title="Y (mm)",
+            zaxis_title="Depth (mm)",
             aspectmode="manual",
-            aspectratio=dict(x=W / max(H, W), y=H / max(H, W), z=0.4),
+            aspectratio=dict(x=x_range_mm / xy_max, y=y_range_mm / xy_max,
+                             z=z_ratio),
         ),
         margin=dict(l=0, r=0, t=40, b=0),
     )
@@ -676,6 +791,16 @@ def run():
         raise FileNotFoundError(f"Could not read image: {IMAGE_PATH}")
     rgb_frame = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
     print(f"Image loaded: {rgb_frame.shape[1]} x {rgb_frame.shape[0]} px")
+
+    # Compute physical pixel size from the FULL image before any crop is applied.
+    # MAX_Z_MM is used as the working distance: at that depth the scene diagonal
+    # spans  2*MAX_Z_MM*tan(FOV/2) mm, which sets the mm/pixel ratio.
+    full_H, full_W = rgb_frame.shape[:2]
+    pixel_size_mm  = compute_pixel_size_mm(full_W, full_H,
+                                           FOV_DIAGONAL_DEG, MAX_Z_MM)
+    print(f"  Pixel size        : {pixel_size_mm:.4f} mm/px  "
+          f"(FOV {FOV_DIAGONAL_DEG}° diag, max-z {MAX_Z_MM} mm  →  "
+          f"{full_W * pixel_size_mm:.1f} x {full_H * pixel_size_mm:.1f} mm scene)")
 
     # ── Crop selection ────────────────────────────────────────────────────────
     print("\nCrop options:")
@@ -728,7 +853,7 @@ def run():
     print("Running inference ...")
     raw_depth = model.infer_image(bgr_frame)
     depth     = renorm_depth(raw_depth, invert=INVERT_DEPTH)
-    # depth is now [0=close, 1=far]
+    # depth is now normalised to [0, 1]; with INVERT_DEPTH=False, close=0, far=1.
 
     # ── Apply crop ────────────────────────────────────────────────────────────
     if crop:
@@ -739,22 +864,31 @@ def run():
         depth_work = depth
         crop_mask  = None
 
+    # depth_display: invert so close pixels = high values (protrude / convex).
+    # renorm_depth() with INVERT_DEPTH=False gives close=0, far=1, so we flip.
+    # All 3-D outputs (PLY, STL, HTML) share this same convention.
+    depth_display = np.max(depth_work) - depth_work
+
     # ── PLY mesh (visualisation) ──────────────────────────────────────────────
-    # PLY inverts depth (max - depth) so that closer = lower depth value = higher z.
+    # PLY needs a vertical flip for OpenGL-style y-axis; depth convention is
+    # already correct via depth_display.
     print("\nBuilding PLY mesh ...")
-    ply_depth = np.flipud(np.max(depth_work) - depth_work)
+    ply_depth = np.flipud(depth_display)
     ply_rgb   = np.flipud(rgb_work)
-    ply_mesh  = build_ply_mesh(ply_depth, rgb_image=ply_rgb, dz=DZ_SCALE)
+    ply_mesh  = build_ply_mesh(ply_depth, rgb_image=ply_rgb,
+                               dz=MAX_Z_MM, xy_scale=pixel_size_mm)
     ply_path  = os.path.join(save_folder, "Object_Mesh.ply")
     o3d.io.write_triangle_mesh(ply_path, ply_mesh)
     print(f"  Saved PLY mesh    -> {ply_path}")
 
     # ── STL solid ─────────────────────────────────────────────────────────────
-    # depth_work: 0=close, 1=far. depth_to_stl_z() inverts so closer = higher z
-    # = convex protrusion.
+    # depth_display: close = high. depth_to_stl_z() maps high -> high z so the
+    # near region protrudes upward (convex relief) as expected.
     print("Building STL solid ...")
-    stl_tris = build_solid_stl(depth_work, dz=DZ_SCALE,
-                               base_mm=STL_BASE_MM, mask=crop_mask)
+    stl_tris = build_solid_stl(depth_display, dz=MAX_Z_MM,
+                               base_mm=STL_BASE_MM, mask=crop_mask,
+                               xy_scale=pixel_size_mm,
+                               edge_smooth_px=STL_EDGE_SMOOTH_PX)
     stl_path = os.path.join(save_folder, "Object_Solid.stl")
     write_stl(stl_tris, stl_path)
 
@@ -763,9 +897,11 @@ def run():
     save_heatmap(depth_work,
                  os.path.join(save_folder, "Depth_Map_Heatmap.png"))
     save_contour(depth_work,
-                 os.path.join(save_folder, "Depth_Map_Contour.png"))
-    save_contour_3d_html(depth_work,
-                         os.path.join(save_folder, "Depth_Map_Contour_3D.html"))
+                 os.path.join(save_folder, "Depth_Map_Contour.png"),
+                 xy_scale=pixel_size_mm)
+    save_contour_3d_html(depth_display,
+                         os.path.join(save_folder, "Depth_Map_Contour_3D.html"),
+                         dz=MAX_Z_MM, xy_scale=pixel_size_mm)
 
     print(f"\nAll done! Files saved to:\n  {save_folder}")
 
