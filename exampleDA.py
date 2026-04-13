@@ -47,8 +47,18 @@ ENCODER      = "vitl"    # "vits" | "vitb" | "vitl"
 INDOOR_MODE  = False     # True = metric metres, False = relative depth
 INVERT_DEPTH = False     # True -> closer = brighter in heatmap/PLY
 
-DZ_SCALE     = 150       # Depth relief scale applied to normalised [0-1] depth
-STL_BASE_MM  = 1.0       # Flat base thickness below the deepest point
+# Physical scale — computed from the full image BEFORE any crop is applied.
+# FOV_DIAGONAL_DEG : diagonal field of view of the camera/sensor in degrees.
+# FOV_DISTANCE_MM  : distance (mm) at which that FOV is measured.
+# Together these determine how many mm each pixel represents.
+# Example: 90° diagonal FOV, 100 mm distance → scene diagonal ≈ 200 mm.
+FOV_DIAGONAL_DEG = 90.0   # degrees  — diagonal field of view
+FOV_DISTANCE_MM  = 100.0  # mm       — working distance
+
+# Maximum z-height (depth relief) of the 3-D outputs, in mm.
+MAX_Z_MM     = 20.0        # mm  — tallest point of the relief surface
+
+STL_BASE_MM  = 1.0         # mm  — flat base thickness below the deepest point
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -391,6 +401,30 @@ def load_crop(path: str) -> dict | None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  PHYSICAL SCALE
+# ══════════════════════════════════════════════════════════════════════════════
+def compute_pixel_size_mm(W: int, H: int,
+                          fov_diagonal_deg: float,
+                          distance_mm: float) -> float:
+    """
+    Return the physical size of one pixel in mm.
+
+    The diagonal FOV of the sensor covers a physical span of
+        physical_diagonal_mm = 2 * distance_mm * tan(fov_diagonal_deg / 2)
+    spread across sqrt(W^2 + H^2) pixels, giving:
+        pixel_size_mm = physical_diagonal_mm / sqrt(W^2 + H^2)
+
+    This is always computed from the FULL image dimensions so that the
+    physical scale is consistent regardless of which crop is applied later.
+    """
+    import math
+    half_angle_rad    = math.radians(fov_diagonal_deg / 2.0)
+    phys_diagonal_mm  = 2.0 * distance_mm * math.tan(half_angle_rad)
+    pixel_diagonal_px = math.sqrt(W ** 2 + H ** 2)
+    return phys_diagonal_mm / pixel_diagonal_px
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  MODEL
 # ══════════════════════════════════════════════════════════════════════════════
 def load_model():
@@ -441,13 +475,14 @@ def renorm_depth(depth: np.ndarray, invert: bool = True) -> np.ndarray:
 def build_ply_mesh(depth_map: np.ndarray,
                    rgb_image: np.ndarray | None = None,
                    cmap_name: str = "gray",
-                   dz: float = 1.0) -> o3d.geometry.TriangleMesh:
+                   dz: float = 1.0,
+                   xy_scale: float = 1.0) -> o3d.geometry.TriangleMesh:
     H, W     = depth_map.shape
     scaled   = depth_map * dz
 
     jj, ii   = np.meshgrid(np.arange(W), np.arange(H))
-    vertices = np.column_stack([jj.ravel().astype(float),
-                                ii.ravel().astype(float),
+    vertices = np.column_stack([jj.ravel().astype(float) * xy_scale,
+                                ii.ravel().astype(float) * xy_scale,
                                 scaled.ravel().astype(float)])
 
     if rgb_image is not None:
@@ -509,7 +544,8 @@ def depth_to_stl_z(depth_map: np.ndarray, dz: float, base_mm: float,
 def build_solid_stl(depth_map: np.ndarray,
                     dz: float,
                     base_mm: float,
-                    mask: np.ndarray | None = None) -> list:
+                    mask: np.ndarray | None = None,
+                    xy_scale: float = 1.0) -> list:
     """Build a watertight solid. Top surface = depth relief, bottom = flat at z=0."""
     H, W      = depth_map.shape
     z_surface = depth_to_stl_z(depth_map, dz, base_mm, mask)
@@ -526,50 +562,50 @@ def build_solid_stl(depth_map: np.ndarray,
     # Top surface
     for i in range(H - 1):
         for j in range(W - 1):
-            p00 = np.array([j,   i,   z_surface[i,   j  ]], dtype=float)
-            p10 = np.array([j+1, i,   z_surface[i,   j+1]], dtype=float)
-            p01 = np.array([j,   i+1, z_surface[i+1, j  ]], dtype=float)
-            p11 = np.array([j+1, i+1, z_surface[i+1, j+1]], dtype=float)
+            p00 = np.array([j   * xy_scale, i   * xy_scale, z_surface[i,   j  ]], dtype=float)
+            p10 = np.array([(j+1)*xy_scale, i   * xy_scale, z_surface[i,   j+1]], dtype=float)
+            p01 = np.array([j   * xy_scale, (i+1)*xy_scale, z_surface[i+1, j  ]], dtype=float)
+            p11 = np.array([(j+1)*xy_scale, (i+1)*xy_scale, z_surface[i+1, j+1]], dtype=float)
             tri(p00, p10, p01)
             tri(p10, p11, p01)
 
     # Bottom face (z=0, reversed winding -> normal points down)
     for i in range(H - 1):
         for j in range(W - 1):
-            b00 = np.array([j,   i,   0.0], dtype=float)
-            b10 = np.array([j+1, i,   0.0], dtype=float)
-            b01 = np.array([j,   i+1, 0.0], dtype=float)
-            b11 = np.array([j+1, i+1, 0.0], dtype=float)
+            b00 = np.array([j   * xy_scale, i   * xy_scale, 0.0], dtype=float)
+            b10 = np.array([(j+1)*xy_scale, i   * xy_scale, 0.0], dtype=float)
+            b01 = np.array([j   * xy_scale, (i+1)*xy_scale, 0.0], dtype=float)
+            b11 = np.array([(j+1)*xy_scale, (i+1)*xy_scale, 0.0], dtype=float)
             tri(b00, b01, b10)
             tri(b10, b01, b11)
 
     # Side walls
     for i in range(H - 1):   # left (j=0)
-        t  = np.array([0, i,   z_surface[i,   0]], dtype=float)
-        b  = np.array([0, i,   0.0],               dtype=float)
-        tn = np.array([0, i+1, z_surface[i+1, 0]], dtype=float)
-        bn = np.array([0, i+1, 0.0],               dtype=float)
+        t  = np.array([0.0,           i   * xy_scale, z_surface[i,   0]], dtype=float)
+        b  = np.array([0.0,           i   * xy_scale, 0.0],               dtype=float)
+        tn = np.array([0.0,           (i+1)*xy_scale, z_surface[i+1, 0]], dtype=float)
+        bn = np.array([0.0,           (i+1)*xy_scale, 0.0],               dtype=float)
         tri(t, b, tn);  tri(b, bn, tn)
 
     for i in range(H - 1):   # right (j=W-1)
-        t  = np.array([W-1, i,   z_surface[i,   W-1]], dtype=float)
-        b  = np.array([W-1, i,   0.0],                 dtype=float)
-        tn = np.array([W-1, i+1, z_surface[i+1, W-1]], dtype=float)
-        bn = np.array([W-1, i+1, 0.0],                 dtype=float)
+        t  = np.array([(W-1)*xy_scale, i   * xy_scale, z_surface[i,   W-1]], dtype=float)
+        b  = np.array([(W-1)*xy_scale, i   * xy_scale, 0.0],                 dtype=float)
+        tn = np.array([(W-1)*xy_scale, (i+1)*xy_scale, z_surface[i+1, W-1]], dtype=float)
+        bn = np.array([(W-1)*xy_scale, (i+1)*xy_scale, 0.0],                 dtype=float)
         tri(t, tn, b);  tri(b, tn, bn)
 
     for j in range(W - 1):   # top edge (i=0)
-        t  = np.array([j,   0, z_surface[0, j  ]], dtype=float)
-        b  = np.array([j,   0, 0.0],               dtype=float)
-        tn = np.array([j+1, 0, z_surface[0, j+1]], dtype=float)
-        bn = np.array([j+1, 0, 0.0],               dtype=float)
+        t  = np.array([j   * xy_scale, 0.0,           z_surface[0, j  ]], dtype=float)
+        b  = np.array([j   * xy_scale, 0.0,           0.0],               dtype=float)
+        tn = np.array([(j+1)*xy_scale, 0.0,           z_surface[0, j+1]], dtype=float)
+        bn = np.array([(j+1)*xy_scale, 0.0,           0.0],               dtype=float)
         tri(t, tn, b);  tri(b, tn, bn)
 
     for j in range(W - 1):   # bottom edge (i=H-1)
-        t  = np.array([j,   H-1, z_surface[H-1, j  ]], dtype=float)
-        b  = np.array([j,   H-1, 0.0],                 dtype=float)
-        tn = np.array([j+1, H-1, z_surface[H-1, j+1]], dtype=float)
-        bn = np.array([j+1, H-1, 0.0],                 dtype=float)
+        t  = np.array([j   * xy_scale, (H-1)*xy_scale, z_surface[H-1, j  ]], dtype=float)
+        b  = np.array([j   * xy_scale, (H-1)*xy_scale, 0.0],                 dtype=float)
+        tn = np.array([(j+1)*xy_scale, (H-1)*xy_scale, z_surface[H-1, j+1]], dtype=float)
+        bn = np.array([(j+1)*xy_scale, (H-1)*xy_scale, 0.0],                 dtype=float)
         tri(t, b, tn);  tri(b, bn, tn)
 
     return triangles
@@ -603,9 +639,12 @@ def save_heatmap(depth: np.ndarray, path: str):
     print(f"  Saved heatmap     -> {path}")
 
 
-def save_contour(depth: np.ndarray, path: str, levels: int = 150):
+def save_contour(depth: np.ndarray, path: str, levels: int = 150,
+                 xy_scale: float = 1.0):
     H, W  = depth.shape
-    x, y  = np.meshgrid(np.arange(W), np.arange(H))
+    x = np.arange(W) * xy_scale
+    y = np.arange(H) * xy_scale
+    x, y  = np.meshgrid(x, y)
     dpos  = depth[depth > 0]
     if len(dpos) == 0:
         print("  Contour skipped (no positive depth values).")
@@ -616,31 +655,40 @@ def save_contour(depth: np.ndarray, path: str, levels: int = 150):
     c = ax.contour(x, y, depth, colors="black", levels=lvls, linewidths=0.8)
     plt.clabel(c, inline=True, fontsize=7, levels=c.levels[::2])
     ax.set_title("Depth Map - Contour")
+    ax.set_xlabel("X (mm)")
+    ax.set_ylabel("Y (mm)")
     ax.set_aspect("equal")
     fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved contour     -> {path}")
 
 
-def save_contour_3d_html(depth: np.ndarray, path: str, step: int = 4):
+def save_contour_3d_html(depth: np.ndarray, path: str, step: int = 4,
+                         dz: float = 1.0, xy_scale: float = 1.0):
     """
     Export an interactive, orbiteable 3-D surface plot with contour lines as a
     self-contained HTML file using Plotly.  Contour lines are drawn directly on
     the surface so the plot acts as both a depth surface and a contour map.
     'step' downsamples the depth map so the file stays manageable
     (step=4 -> uses every 4th pixel in x and y).
+    x/y axes are in mm (xy_scale mm per pixel); z axis is in mm (dz applied).
     """
-    d = depth[::step, ::step]
+    d = depth[::step, ::step] * dz
     H, W = d.shape
-    x = np.arange(W) * step
-    y = np.arange(H) * step
+    x = np.arange(W) * step * xy_scale
+    y = np.arange(H) * step * xy_scale
+
+    x_range_mm = x[-1] if len(x) > 1 else 1.0
+    y_range_mm = y[-1] if len(y) > 1 else 1.0
+    xy_max     = max(x_range_mm, y_range_mm)
+    z_ratio    = (dz / xy_max) if xy_max > 0 else 0.4
 
     fig = go.Figure(data=[go.Surface(
         z=d,
         x=x,
         y=y,
         colorscale="Viridis",
-        colorbar=dict(title="Depth"),
+        colorbar=dict(title="Depth (mm)"),
         lighting=dict(ambient=0.6, diffuse=0.8, specular=0.3),
         contours=dict(
             z=dict(
@@ -656,11 +704,12 @@ def save_contour_3d_html(depth: np.ndarray, path: str, step: int = 4):
     fig.update_layout(
         title="Depth Map - Interactive 3D Contour Surface (orbit with mouse)",
         scene=dict(
-            xaxis_title="X (px)",
-            yaxis_title="Y (px)",
-            zaxis_title="Depth",
+            xaxis_title="X (mm)",
+            yaxis_title="Y (mm)",
+            zaxis_title="Depth (mm)",
             aspectmode="manual",
-            aspectratio=dict(x=W / max(H, W), y=H / max(H, W), z=0.4),
+            aspectratio=dict(x=x_range_mm / xy_max, y=y_range_mm / xy_max,
+                             z=z_ratio),
         ),
         margin=dict(l=0, r=0, t=40, b=0),
     )
@@ -688,6 +737,14 @@ def run():
         raise FileNotFoundError(f"Could not read image: {IMAGE_PATH}")
     rgb_frame = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
     print(f"Image loaded: {rgb_frame.shape[1]} x {rgb_frame.shape[0]} px")
+
+    # Compute physical pixel size from the FULL image before any crop is applied.
+    full_H, full_W = rgb_frame.shape[:2]
+    pixel_size_mm  = compute_pixel_size_mm(full_W, full_H,
+                                           FOV_DIAGONAL_DEG, FOV_DISTANCE_MM)
+    print(f"  Pixel size        : {pixel_size_mm:.4f} mm/px  "
+          f"(FOV {FOV_DIAGONAL_DEG}° diag @ {FOV_DISTANCE_MM} mm  →  "
+          f"{full_W * pixel_size_mm:.1f} x {full_H * pixel_size_mm:.1f} mm scene)")
 
     # ── Crop selection ────────────────────────────────────────────────────────
     print("\nCrop options:")
@@ -762,7 +819,8 @@ def run():
     print("\nBuilding PLY mesh ...")
     ply_depth = np.flipud(depth_display)
     ply_rgb   = np.flipud(rgb_work)
-    ply_mesh  = build_ply_mesh(ply_depth, rgb_image=ply_rgb, dz=DZ_SCALE)
+    ply_mesh  = build_ply_mesh(ply_depth, rgb_image=ply_rgb,
+                               dz=MAX_Z_MM, xy_scale=pixel_size_mm)
     ply_path  = os.path.join(save_folder, "Object_Mesh.ply")
     o3d.io.write_triangle_mesh(ply_path, ply_mesh)
     print(f"  Saved PLY mesh    -> {ply_path}")
@@ -771,8 +829,9 @@ def run():
     # depth_display: close = high. depth_to_stl_z() maps high -> high z so the
     # near region protrudes upward (convex relief) as expected.
     print("Building STL solid ...")
-    stl_tris = build_solid_stl(depth_display, dz=DZ_SCALE,
-                               base_mm=STL_BASE_MM, mask=crop_mask)
+    stl_tris = build_solid_stl(depth_display, dz=MAX_Z_MM,
+                               base_mm=STL_BASE_MM, mask=crop_mask,
+                               xy_scale=pixel_size_mm)
     stl_path = os.path.join(save_folder, "Object_Solid.stl")
     write_stl(stl_tris, stl_path)
 
@@ -781,9 +840,11 @@ def run():
     save_heatmap(depth_work,
                  os.path.join(save_folder, "Depth_Map_Heatmap.png"))
     save_contour(depth_work,
-                 os.path.join(save_folder, "Depth_Map_Contour.png"))
+                 os.path.join(save_folder, "Depth_Map_Contour.png"),
+                 xy_scale=pixel_size_mm)
     save_contour_3d_html(depth_display,
-                         os.path.join(save_folder, "Depth_Map_Contour_3D.html"))
+                         os.path.join(save_folder, "Depth_Map_Contour_3D.html"),
+                         dz=MAX_Z_MM, xy_scale=pixel_size_mm)
 
     print(f"\nAll done! Files saved to:\n  {save_folder}")
 
