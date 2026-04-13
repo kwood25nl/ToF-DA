@@ -6,7 +6,8 @@ Outputs (in a timestamped subfolder of SAVE_ROOT):
   - Depth_Map_Contour.png
   - Depth_Map_Contour_3D.html   <- interactive, orbiteable in any browser
   - Object_Mesh.ply             (coloured, for visualisation)
-  - Object_Solid.stl            (solid, 3-D printable; 1 mm flat base + depth relief)
+  - Object_Solid.stl            (solid, 3-D printable; base + depth relief,
+                                  footprint = crop shape, smoothed edge taper)
   - crop_region.json            (saved crop path for this run)
   - crop_region_saved.json      (persistent across runs, in SAVE_ROOT)
   - crop_description.txt        (mathematical description for reports)
@@ -59,7 +60,8 @@ FOV_DIAGONAL_DEG = 90.0   # degrees  — diagonal field of view
 # This doubles as the working distance for the FOV → mm/px calculation.
 MAX_Z_MM     = 20.0        # mm  — scene depth & tallest point of the relief
 
-STL_BASE_MM  = 1.0         # mm  — flat base thickness below the deepest point
+STL_BASE_MM       = 1.0    # mm  — flat base thickness below the deepest point
+STL_EDGE_SMOOTH_PX = 3    # px  — smoothstep taper width at the crop boundary
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -547,10 +549,36 @@ def build_solid_stl(depth_map: np.ndarray,
                     dz: float,
                     base_mm: float,
                     mask: np.ndarray | None = None,
-                    xy_scale: float = 1.0) -> list:
-    """Build a watertight solid. Top surface = depth relief, bottom = flat at z=0."""
+                    xy_scale: float = 1.0,
+                    edge_smooth_px: int = 3) -> list:
+    """Build a watertight solid whose footprint matches the mask (crop shape).
+
+    Changes vs. previous version
+    -----------------------------
+    * Base only in crop area: cells entirely outside the mask are skipped, so
+      the solid's base and perimeter follow the crop boundary, not the full
+      bounding-box rectangle.
+    * Smooth xy edges: a smoothstep taper (edge_smooth_px wide) fades z toward
+      base_mm at the crop boundary, removing the staircase cliff while leaving
+      all interior z values untouched.
+    * Perimeter walls follow the mask boundary: a wall quad is emitted on every
+      edge of an active cell that borders a non-active cell (or the grid edge).
+    """
+    from scipy.ndimage import distance_transform_edt
+
     H, W      = depth_map.shape
     z_surface = depth_to_stl_z(depth_map, dz, base_mm, mask)
+
+    # ── Edge smoothing ────────────────────────────────────────────────────────
+    # Ramp z toward base_mm within edge_smooth_px pixels of the mask boundary.
+    # Only inside-mask pixels are altered; interior z data is preserved.
+    if mask is not None and edge_smooth_px > 0:
+        dist = distance_transform_edt(mask)              # 0 at edge, + inward
+        t    = np.clip(dist / float(edge_smooth_px), 0.0, 1.0)
+        t    = t * t * (3.0 - 2.0 * t)                  # smoothstep
+        z_surface = np.where(mask,
+                             base_mm + (z_surface - base_mm) * t,
+                             z_surface)
 
     triangles = []
 
@@ -561,54 +589,78 @@ def build_solid_stl(depth_map: np.ndarray,
         n  = (n / ln) if ln > 0 else n
         triangles.append((n, a, b, c))
 
-    # Top surface
+    def vtop(r, c):
+        return np.array([c * xy_scale, r * xy_scale, z_surface[r, c]], dtype=float)
+
+    def vbot(r, c):
+        return np.array([c * xy_scale, r * xy_scale, 0.0], dtype=float)
+
+    # ── Active cells ──────────────────────────────────────────────────────────
+    # A cell (i,j) is active if at least one of its four corner pixels is inside
+    # the mask (or always active when there is no mask).
+    if mask is not None:
+        m          = mask.astype(np.uint8)
+        corner_sum = (m[:-1, :-1].astype(np.int32) + m[:-1, 1:]
+                      + m[1:, :-1] + m[1:, 1:])
+        active = corner_sum > 0                          # shape (H-1, W-1)
+    else:
+        active = np.ones((H - 1, W - 1), dtype=bool)
+
+    # Pad active with False so boundary lookups never go out of range.
+    # ap[i+1, j+1] == active[i, j]
+    ap = np.zeros((H + 1, W + 1), dtype=bool)
+    ap[1:H, 1:W] = active
+
+    # ── Top surface ───────────────────────────────────────────────────────────
     for i in range(H - 1):
         for j in range(W - 1):
-            p00 = np.array([j   * xy_scale, i   * xy_scale, z_surface[i,   j  ]], dtype=float)
-            p10 = np.array([(j+1)*xy_scale, i   * xy_scale, z_surface[i,   j+1]], dtype=float)
-            p01 = np.array([j   * xy_scale, (i+1)*xy_scale, z_surface[i+1, j  ]], dtype=float)
-            p11 = np.array([(j+1)*xy_scale, (i+1)*xy_scale, z_surface[i+1, j+1]], dtype=float)
-            tri(p00, p10, p01)
-            tri(p10, p11, p01)
+            if not active[i, j]:
+                continue
+            p00 = vtop(i,   j  );  p10 = vtop(i,   j+1)
+            p01 = vtop(i+1, j  );  p11 = vtop(i+1, j+1)
+            tri(p00, p10, p01);    tri(p10, p11, p01)
 
-    # Bottom face (z=0, reversed winding -> normal points down)
+    # ── Bottom face ───────────────────────────────────────────────────────────
     for i in range(H - 1):
         for j in range(W - 1):
-            b00 = np.array([j   * xy_scale, i   * xy_scale, 0.0], dtype=float)
-            b10 = np.array([(j+1)*xy_scale, i   * xy_scale, 0.0], dtype=float)
-            b01 = np.array([j   * xy_scale, (i+1)*xy_scale, 0.0], dtype=float)
-            b11 = np.array([(j+1)*xy_scale, (i+1)*xy_scale, 0.0], dtype=float)
-            tri(b00, b01, b10)
-            tri(b10, b01, b11)
+            if not active[i, j]:
+                continue
+            b00 = vbot(i,   j  );  b10 = vbot(i,   j+1)
+            b01 = vbot(i+1, j  );  b11 = vbot(i+1, j+1)
+            tri(b00, b01, b10);    tri(b10, b01, b11)
 
-    # Side walls
-    for i in range(H - 1):   # left (j=0)
-        t  = np.array([0.0,           i   * xy_scale, z_surface[i,   0]], dtype=float)
-        b  = np.array([0.0,           i   * xy_scale, 0.0],               dtype=float)
-        tn = np.array([0.0,           (i+1)*xy_scale, z_surface[i+1, 0]], dtype=float)
-        bn = np.array([0.0,           (i+1)*xy_scale, 0.0],               dtype=float)
-        tri(t, b, tn);  tri(b, bn, tn)
+    # ── Perimeter walls ───────────────────────────────────────────────────────
+    # For each active cell, emit a wall quad on any edge that borders a
+    # non-active cell (or the grid boundary).  Winding is chosen so the
+    # computed normal points away from the solid (outward).
+    for i in range(H - 1):
+        for j in range(W - 1):
+            if not active[i, j]:
+                continue
 
-    for i in range(H - 1):   # right (j=W-1)
-        t  = np.array([(W-1)*xy_scale, i   * xy_scale, z_surface[i,   W-1]], dtype=float)
-        b  = np.array([(W-1)*xy_scale, i   * xy_scale, 0.0],                 dtype=float)
-        tn = np.array([(W-1)*xy_scale, (i+1)*xy_scale, z_surface[i+1, W-1]], dtype=float)
-        bn = np.array([(W-1)*xy_scale, (i+1)*xy_scale, 0.0],                 dtype=float)
-        tri(t, tn, b);  tri(b, tn, bn)
+            # Top edge (grid row i): neighbour above → ap[i, j+1]
+            if not ap[i, j + 1]:
+                t0 = vtop(i, j);  t1 = vtop(i, j+1)
+                b0 = vbot(i, j);  b1 = vbot(i, j+1)
+                tri(t0, b0, t1);  tri(b0, b1, t1)        # normal -y
 
-    for j in range(W - 1):   # top edge (i=0)
-        t  = np.array([j   * xy_scale, 0.0,           z_surface[0, j  ]], dtype=float)
-        b  = np.array([j   * xy_scale, 0.0,           0.0],               dtype=float)
-        tn = np.array([(j+1)*xy_scale, 0.0,           z_surface[0, j+1]], dtype=float)
-        bn = np.array([(j+1)*xy_scale, 0.0,           0.0],               dtype=float)
-        tri(t, tn, b);  tri(b, tn, bn)
+            # Bottom edge (grid row i+1): neighbour below → ap[i+2, j+1]
+            if not ap[i + 2, j + 1]:
+                t0 = vtop(i+1, j);  t1 = vtop(i+1, j+1)
+                b0 = vbot(i+1, j);  b1 = vbot(i+1, j+1)
+                tri(t0, t1, b0);    tri(b0, t1, b1)       # normal +y
 
-    for j in range(W - 1):   # bottom edge (i=H-1)
-        t  = np.array([j   * xy_scale, (H-1)*xy_scale, z_surface[H-1, j  ]], dtype=float)
-        b  = np.array([j   * xy_scale, (H-1)*xy_scale, 0.0],                 dtype=float)
-        tn = np.array([(j+1)*xy_scale, (H-1)*xy_scale, z_surface[H-1, j+1]], dtype=float)
-        bn = np.array([(j+1)*xy_scale, (H-1)*xy_scale, 0.0],                 dtype=float)
-        tri(t, b, tn);  tri(b, bn, tn)
+            # Left edge (grid col j): neighbour left → ap[i+1, j]
+            if not ap[i + 1, j]:
+                t0 = vtop(i, j);  t1 = vtop(i+1, j)
+                b0 = vbot(i, j);  b1 = vbot(i+1, j)
+                tri(t0, t1, b0);  tri(b0, t1, b1)         # normal -x
+
+            # Right edge (grid col j+1): neighbour right → ap[i+1, j+2]
+            if not ap[i + 1, j + 2]:
+                t0 = vtop(i, j+1);  t1 = vtop(i+1, j+1)
+                b0 = vbot(i, j+1);  b1 = vbot(i+1, j+1)
+                tri(t0, b0, t1);    tri(b0, b1, t1)        # normal +x
 
     return triangles
 
@@ -835,7 +887,8 @@ def run():
     print("Building STL solid ...")
     stl_tris = build_solid_stl(depth_display, dz=MAX_Z_MM,
                                base_mm=STL_BASE_MM, mask=crop_mask,
-                               xy_scale=pixel_size_mm)
+                               xy_scale=pixel_size_mm,
+                               edge_smooth_px=STL_EDGE_SMOOTH_PX)
     stl_path = os.path.join(save_folder, "Object_Solid.stl")
     write_stl(stl_tris, stl_path)
 
