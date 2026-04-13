@@ -740,7 +740,8 @@ def run():
         crop_mask  = None
 
     # ── PLY mesh (visualisation) ──────────────────────────────────────────────
-    # PLY inverts depth (max - depth) so that closer = lower depth value = higher z.
+    # PLY inverts depth (max - depth) so that closer pixels (lower depth value)
+    # produce higher z values after inversion.
     print("\nBuilding PLY mesh ...")
     ply_depth = np.flipud(np.max(depth_work) - depth_work)
     ply_rgb   = np.flipud(rgb_work)
