@@ -20,11 +20,17 @@ Depth Anything V2 (non-metric) gives relative depth. This script:
 
 4) Scales the entire point cloud proportionally by s (X,Y,Z all multiplied by s).
 
-Orientation
------------
-Depth maps and images often need a vertical flip for the desired coordinate
-system. This script applies a vertical flip to BOTH the RGB (for point colors)
-and the depth map (for geometry) so both outputs match.
+Orientation (inspired by exampleDA.py)
+--------------------------------------
+In your exampleDA.py, the Open3D export is corrected with:
+
+  ply_depth = np.flipud(depth)
+  ply_rgb   = np.flipud(rgb)
+
+We do the same:
+- We do NOT flip the image before inference.
+- We flip the depth map *after* it is computed, and we flip rgb only for
+  coloring the point cloud.
 
 Downsampling
 ------------
@@ -127,17 +133,17 @@ def normalize_depth_01(depth: np.ndarray, invert: bool) -> np.ndarray:
     return d
 
 
-def compute_uniform_scale_mm_per_px(w: int, h: int) -> tuple[float, float, float, float]:
-    """Return (s_mm_per_px, diag_px, target_diag_mm, target_diag_mm/diag_px)."""
+def compute_uniform_scale_mm_per_px(w: int, h: int) -> tuple[float, float, float]:
+    """Return (s_mm_per_px, diag_px, target_diag_mm)."""
     diag_px = math.sqrt(w * w + h * h)
     target_diag_mm = DIST_MM * 2.0 * math.tan(math.radians(FOV_DIAGONAL_DEG / 2.0))
     s = target_diag_mm / diag_px
-    return s, diag_px, target_diag_mm, s
+    return s, diag_px, target_diag_mm
 
 
 def build_point_cloud_uniform_mm(
     depth01_close_high: np.ndarray,
-    rgb: np.ndarray | None,
+    rgb_for_color: np.ndarray | None,
     s_mm_per_px: float,
     step: int,
 ) -> o3d.geometry.PointCloud:
@@ -161,8 +167,8 @@ def build_point_cloud_uniform_mm(
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
 
-    if rgb is not None:
-        rgb_s = rgb[::step, ::step].reshape(-1, 3).astype(np.float32) / 255.0
+    if rgb_for_color is not None:
+        rgb_s = rgb_for_color[::step, ::step].reshape(-1, 3).astype(np.float32) / 255.0
         pcd.colors = o3d.utility.Vector3dVector(rgb_s.astype(np.float64))
 
     return pcd
@@ -241,13 +247,7 @@ def run():
     if bgr is None:
         raise FileNotFoundError(f"Could not read image: {IMAGE_PATH}")
 
-    # Keep bgr for inference; make rgb for coloring
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-
-    # Fix orientation: vertical flip (applies to both geometry and colors)
-    bgr = np.flipud(bgr)
-    rgb = np.flipud(rgb)
-
     h, w = rgb.shape[:2]
     print(f"Loaded image: {w} x {h} px")
 
@@ -262,11 +262,12 @@ def run():
     # We want close = high (better relief). Flip normalized map.
     depth01_close_high = float(np.max(d01)) - d01
 
-    # Ensure depth orientation matches image (vertical flip)
+    # Orientation fix (match exampleDA.py PLY export): flip vertically for geometry & colors
     depth01_close_high = np.flipud(depth01_close_high)
+    rgb_for_color = np.flipud(rgb)
 
-    # Compute uniform scale AFTER inference (as you suggested)
-    s, diag_px, target_diag_mm, _ = compute_uniform_scale_mm_per_px(w, h)
+    # Uniform scale factor based on FOV+distance
+    s, diag_px, target_diag_mm = compute_uniform_scale_mm_per_px(w, h)
 
     print(
         "Uniform scaling (mm):\n"
@@ -278,7 +279,7 @@ def run():
     )
 
     print("Building point cloud ...")
-    pcd = build_point_cloud_uniform_mm(depth01_close_high, rgb=rgb, s_mm_per_px=s, step=PLY_STEP)
+    pcd = build_point_cloud_uniform_mm(depth01_close_high, rgb_for_color=rgb_for_color, s_mm_per_px=s, step=PLY_STEP)
 
     if VOXEL_DOWNSAMPLE_MM is not None:
         print(f"Voxel downsample: {VOXEL_DOWNSAMPLE_MM} mm")
