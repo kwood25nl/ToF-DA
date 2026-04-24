@@ -7,36 +7,30 @@ Outputs (written to OUTPUT_DIR)
 
 Scaling (what this script does)
 -------------------------------
-Depth Anything V2 (non-metric) gives relative depth. You asked for:
+Depth Anything V2 (non-metric) gives relative depth. This script:
 
-  1) Set the XY diagonal according to camera diagonal FOV + working distance.
-  2) Scale the whole point cloud proportionally (same scale for X, Y, and Z).
-
-We do exactly that by:
-
-- Treating x,y as pixel coordinates (px)
-- Treating z as a relative value in [0..1]
-- Computing a single scale factor s (mm per pixel) from your FOV+distance:
+1) Runs Depth Anything on the image.
+2) Builds an initial point cloud in *pixel units* (x,y in pixels; z in [0..1]).
+3) Computes a single uniform scale factor s (mm per pixel) so that the XY
+   diagonal matches the camera FOV diagonal footprint at DIST_MM:
 
     TARGET_DIAGONAL_MM = DIST_MM * 2 * tan(FOV_DIAGONAL_DEG/2)
     diag_px            = sqrt(W^2 + H^2)
-    s                  = TARGET_DIAGONAL_MM / diag_px   # mm per px
+    s                  = TARGET_DIAGONAL_MM / diag_px
 
-- Applying the same s to x,y,z:
+4) Scales the entire point cloud proportionally by s (X,Y,Z all multiplied by s).
 
-    X_mm = X_px * s
-    Y_mm = Y_px * s
-    Z_mm = Z_rel * s
-
-This keeps the entire point cloud uniformly scaled, with the correct XY
-footprint in mm. Note: Z is still *relative* (not true metric depth), but is
-now in mm units after uniform scaling.
+Orientation
+-----------
+Depth maps and images often need a vertical flip for the desired coordinate
+system. This script applies a vertical flip to BOTH the RGB (for point colors)
+and the depth map (for geometry) so both outputs match.
 
 Downsampling
 ------------
 - PLY_STEP: take every Nth pixel before creating the PLY point cloud.
-- VOXEL_DOWNSAMPLE_MM: optional Open3D voxel downsample in mm (recommended).
-- HTML_STEP: take every Nth pixel for the Plotly surface (controls HTML size).
+- VOXEL_DOWNSAMPLE_MM: optional Open3D voxel downsample in mm.
+- HTML_STEP: take every Nth pixel for the Plotly surface.
 
 Edit these paths
 ----------------
@@ -133,10 +127,12 @@ def normalize_depth_01(depth: np.ndarray, invert: bool) -> np.ndarray:
     return d
 
 
-def compute_uniform_scale_mm_per_px(w: int, h: int) -> float:
+def compute_uniform_scale_mm_per_px(w: int, h: int) -> tuple[float, float, float, float]:
+    """Return (s_mm_per_px, diag_px, target_diag_mm, target_diag_mm/diag_px)."""
     diag_px = math.sqrt(w * w + h * h)
     target_diag_mm = DIST_MM * 2.0 * math.tan(math.radians(FOV_DIAGONAL_DEG / 2.0))
-    return target_diag_mm / diag_px
+    s = target_diag_mm / diag_px
+    return s, diag_px, target_diag_mm, s
 
 
 def build_point_cloud_uniform_mm(
@@ -245,22 +241,15 @@ def run():
     if bgr is None:
         raise FileNotFoundError(f"Could not read image: {IMAGE_PATH}")
 
+    # Keep bgr for inference; make rgb for coloring
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+    # Fix orientation: vertical flip (applies to both geometry and colors)
+    bgr = np.flipud(bgr)
+    rgb = np.flipud(rgb)
+
     h, w = rgb.shape[:2]
     print(f"Loaded image: {w} x {h} px")
-
-    s = compute_uniform_scale_mm_per_px(w, h)
-    diag_px = math.sqrt(w * w + h * h)
-    target_diag_mm = DIST_MM * 2.0 * math.tan(math.radians(FOV_DIAGONAL_DEG / 2.0))
-
-    print(
-        "Uniform scaling (mm):\n"
-        f"  FOV diag         : {FOV_DIAGONAL_DEG} deg\n"
-        f"  DIST_MM          : {DIST_MM} mm\n"
-        f"  TARGET_DIAG_MM   : {target_diag_mm:.2f} mm\n"
-        f"  diag_px          : {diag_px:.2f} px\n"
-        f"  scale s          : {s:.6f} mm/px (applied to X,Y,Z)"
-    )
 
     print("Loading Depth Anything V2 model (non-metric) ...")
     model = load_model_non_metric(DA_PATH, ENCODER)
@@ -272,6 +261,21 @@ def run():
 
     # We want close = high (better relief). Flip normalized map.
     depth01_close_high = float(np.max(d01)) - d01
+
+    # Ensure depth orientation matches image (vertical flip)
+    depth01_close_high = np.flipud(depth01_close_high)
+
+    # Compute uniform scale AFTER inference (as you suggested)
+    s, diag_px, target_diag_mm, _ = compute_uniform_scale_mm_per_px(w, h)
+
+    print(
+        "Uniform scaling (mm):\n"
+        f"  FOV diag         : {FOV_DIAGONAL_DEG} deg\n"
+        f"  DIST_MM          : {DIST_MM} mm\n"
+        f"  TARGET_DIAG_MM   : {target_diag_mm:.2f} mm\n"
+        f"  diag_px          : {diag_px:.2f} px\n"
+        f"  scale s          : {s:.6f} mm/px (applied to X,Y,Z)"
+    )
 
     print("Building point cloud ...")
     pcd = build_point_cloud_uniform_mm(depth01_close_high, rgb=rgb, s_mm_per_px=s, step=PLY_STEP)
