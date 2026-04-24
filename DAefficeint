@@ -1,43 +1,39 @@
-"""Standalone Depth Anything V2 -> scaled point cloud (.ply) + interactive 3D surface (.html)
+"""Standalone Depth Anything V2 (non-metric) -> scaled point cloud (.ply) + interactive 3D surface (.html)
 
-What this script does
----------------------
-1) Loads an image.
-2) Runs Depth Anything V2 (DepthAnythingV2.infer_image) on the image.
-3) Converts depth to a point cloud / surface using pixel coordinates.
-4) If DIST_MM is provided, scales the XY plane so its diagonal equals the
-   camera FOV diagonal footprint at that distance:
+This script is designed to run by itself and produce two outputs:
+  1) PointCloud.ply  (Open3D point cloud)
+  2) Surface_3D.html (interactive orbitable Plotly surface)
 
-      TARGET_BOTTOM_DIAGONAL_MM = DIST_MM * 2 * tan(FOV_DIAGONAL_DEG / 2)
+Key idea (non-metric DA2)
+------------------------
+Depth Anything V2 in non-metric mode produces *relative* depth. To still get
+useful geometry in real units, we:
 
-   and mm-per-pixel:
+  - Scale X/Y using camera diagonal FOV + working distance DIST_MM so the
+    XY plane has the correct physical footprint in mm.
 
-      XY_SCALE_MM_PER_PX = TARGET_BOTTOM_DIAGONAL_MM / sqrt(W^2 + H^2)
+  - Scale Z by mapping the normalized depth range [0..1] into a chosen Z span
+    in mm (Z_SPAN_MM). By default, Z_SPAN_MM = DIST_MM.
 
-5) Downsamples (configurable) to reduce compute.
-6) Writes outputs to OUTPUT_DIR:
-   - PointCloud.ply
-   - Surface_3D.html (interactive orbitable Plotly surface)
+So all coordinates are in **mm**, but Z is a *relative relief* mapped into mm
+(not true metric depth).
 
-Editable paths (as requested)
------------------------------
-Edit IMAGE_PATH, OUTPUT_DIR, and DA_PATH below (top of file).
+XY scaling
+----------
+Given diagonal FOV and distance:
 
-Dependencies
+  TARGET_DIAGONAL_MM = DIST_MM * 2 * tan(FOV_DIAGONAL_DEG/2)
+  XY_SCALE_MM_PER_PX = TARGET_DIAGONAL_MM / sqrt(W^2 + H^2)
+
+Downsampling
 ------------
-- opencv-python
-- numpy
-- torch
-- plotly
-- open3d
-- Depth-Anything-V2 repo present at DA_PATH (as in your existing scripts)
+- PLY_STEP: grid subsample for the point cloud.
+- VOXEL_DOWNSAMPLE_MM: optional Open3D voxel downsample (in mm).
+- HTML_STEP: grid subsample for the Plotly surface.
 
-Notes
------
-- This uses a *relative* depth model by default (INDOOR_MODE=False). The output
-  is therefore not metric Z unless you switch to the metric model.
-- Even with non-metric depth, the XY scaling based on FOV+distance is still
-  useful to size the XY footprint correctly.
+Edit these paths
+----------------
+Set IMAGE_PATH, OUTPUT_DIR, and DA_PATH below.
 """
 
 from __future__ import annotations
@@ -66,26 +62,26 @@ DA_PATH = r"Z:\Cas\Diepte_Herkenning\AIMODELS\Depth-Anything-V2"
 
 
 # =============================================================================
-# USER INPUTS (edit here or wire to CLI if you prefer)
+# USER INPUTS (edit here)
 # =============================================================================
 FOV_DIAGONAL_DEG = 70.47
 
-# Optional working distance used to scale XY to mm.
-# Set to None to skip physical XY scaling (units stay in pixels).
-DIST_MM: float | None = None
+# If no specific distance is given, assume 100 mm (as requested).
+DIST_MM: float = 100.0
+
+# Non-metric depth => we map normalized depth to a chosen Z span (mm).
+# If None, defaults to DIST_MM.
+Z_SPAN_MM: float | None = None
 
 # Depth Anything model selection
 ENCODER = "vitl"  # "vits" | "vitb" | "vitl"
-INDOOR_MODE = False  # True = metric model (metres), False = relative model
 INVERT_DEPTH = False  # True -> invert raw depth before normalizing
 
 # Downsampling controls
-# - HTML surface uses HTML_STEP (bigger step => lighter HTML)
-# - PLY point cloud uses PLY_STEP (grid subsample) then optional voxel downsample
 HTML_STEP = 6
 PLY_STEP = 3
 
-# If set, additional voxel downsample in mm (requires DIST_MM). Recommended 1-5mm.
+# Optional additional voxel downsample in mm (recommended 1-5mm)
 VOXEL_DOWNSAMPLE_MM: float | None = None
 
 # Output filenames
@@ -96,9 +92,8 @@ HTML_FILENAME = "Surface_3D.html"
 
 @dataclass
 class ScaleInfo:
-    xy_scale: float  # units per pixel (mm/px if DIST_MM provided else 1.0)
-    z_scale: float   # units per depth unit (arbitrary unless using metric model)
-    units: str       # "mm" or "px"
+    xy_scale_mm_per_px: float
+    z_span_mm: float
 
 
 def _device() -> str:
@@ -109,8 +104,8 @@ def _device() -> str:
     )
 
 
-def load_model(da_path: str, encoder: str, indoor_mode: bool):
-    """Load Depth Anything V2 model from a local clone at da_path."""
+def load_model_non_metric(da_path: str, encoder: str):
+    """Load Depth Anything V2 non-metric model from a local clone at da_path."""
     if da_path not in sys.path:
         sys.path.insert(0, da_path)
 
@@ -123,34 +118,23 @@ def load_model(da_path: str, encoder: str, indoor_mode: bool):
     dev = _device()
     print(f"Device: {dev}")
 
-    if indoor_mode:
-        # Metric variant (metres). In your other script you used max_depth=10
-        from metric_depth.depth_anything_v2.dpt import DepthAnythingV2
+    from depth_anything_v2.dpt import DepthAnythingV2
 
-        cfg = {**model_configs[encoder], "max_depth": 10}
-        ckpt = os.path.join(
-            da_path, f"checkpoints/depth_anything_v2_metric_hypersim_{encoder}.pth"
-        )
-    else:
-        from depth_anything_v2.dpt import DepthAnythingV2
-
-        cfg = model_configs[encoder]
-        ckpt = os.path.join(da_path, f"checkpoints/depth_anything_v2_{encoder}.pth")
-
+    cfg = model_configs[encoder]
+    ckpt = os.path.join(da_path, f"checkpoints/depth_anything_v2_{encoder}.pth")
     if not os.path.exists(ckpt):
         raise FileNotFoundError(
             f"Checkpoint not found: {ckpt}\n"
-            f"Check DA_PATH and ENCODER/INDOOR_MODE settings."
+            f"Check DA_PATH and ENCODER settings."
         )
 
     model = DepthAnythingV2(**cfg)
     model.load_state_dict(torch.load(ckpt, map_location="cpu"))
-    model = model.to(dev).eval()
-    return model
+    return model.to(dev).eval()
 
 
-def normalize_depth(depth: np.ndarray, invert: bool) -> np.ndarray:
-    """Normalize depth map to [0,1]."""
+def normalize_depth_01(depth: np.ndarray, invert: bool) -> np.ndarray:
+    """Normalize depth to [0,1]."""
     d = depth.astype(np.float32)
     if invert:
         d = 1.0 / (d + 1e-8)
@@ -158,51 +142,34 @@ def normalize_depth(depth: np.ndarray, invert: bool) -> np.ndarray:
     return d
 
 
-def compute_xy_scale_mm_per_px(
-    w: int, h: int, fov_diagonal_deg: float, dist_mm: float
-) -> float:
+def compute_scale_info(w: int, h: int) -> ScaleInfo:
     diag_px = math.sqrt(w * w + h * h)
-    target_diag_mm = dist_mm * 2.0 * math.tan(math.radians(fov_diagonal_deg / 2.0))
-    return target_diag_mm / diag_px
+    target_diag_mm = DIST_MM * 2.0 * math.tan(math.radians(FOV_DIAGONAL_DEG / 2.0))
+    xy_scale = target_diag_mm / diag_px
+
+    z_span = float(DIST_MM if Z_SPAN_MM is None else Z_SPAN_MM)
+    return ScaleInfo(xy_scale_mm_per_px=xy_scale, z_span_mm=z_span)
 
 
-def make_scale_info(w: int, h: int) -> ScaleInfo:
-    if DIST_MM is None:
-        return ScaleInfo(xy_scale=1.0, z_scale=1.0, units="px")
-
-    xy_scale = compute_xy_scale_mm_per_px(w, h, FOV_DIAGONAL_DEG, float(DIST_MM))
-
-    # Z scaling:
-    # - For relative mode: z is still arbitrary; keep in [0..1] but express units
-    #   as "mm" for XY only. We leave z_scale=1.0 so z is "relative units".
-    # - For metric mode: DepthAnything returns metric depth (metres) for the
-    #   metric model; however infer_image() output scaling can differ by version.
-    #   We do not assume it is metres. If you confirm it is metres in your setup,
-    #   you can set z_scale=1000.0 to convert m -> mm.
-    z_scale = 1.0
-    return ScaleInfo(xy_scale=xy_scale, z_scale=z_scale, units="mm")
-
-
-def build_point_cloud(
-    depth01: np.ndarray,
+def build_point_cloud_mm(
+    depth01_close_high: np.ndarray,
     rgb: np.ndarray | None,
     scale: ScaleInfo,
     step: int,
 ) -> o3d.geometry.PointCloud:
-    """Create an Open3D point cloud from a normalized depth map."""
     if step < 1:
         raise ValueError("step must be >= 1")
 
-    d = depth01[::step, ::step]
-    h, w = d.shape
+    d = depth01_close_high[::step, ::step]
+    hh, ww = d.shape
 
-    # Coordinate grids in output units
-    jj, ii = np.meshgrid(np.arange(w), np.arange(h))
-    x = (jj.astype(np.float32) * step) * scale.xy_scale
-    y = (ii.astype(np.float32) * step) * scale.xy_scale
-    z = d.astype(np.float32) * scale.z_scale
+    jj, ii = np.meshgrid(np.arange(ww), np.arange(hh))
 
-    pts = np.stack([x, y, z], axis=-1).reshape(-1, 3)
+    x_mm = (jj.astype(np.float32) * step) * scale.xy_scale_mm_per_px
+    y_mm = (ii.astype(np.float32) * step) * scale.xy_scale_mm_per_px
+    z_mm = d.astype(np.float32) * scale.z_span_mm
+
+    pts = np.stack([x_mm, y_mm, z_mm], axis=-1).reshape(-1, 3)
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
@@ -214,34 +181,31 @@ def build_point_cloud(
     return pcd
 
 
-def save_surface_3d_html(
-    depth01: np.ndarray,
+def save_surface_3d_html_mm(
+    depth01_close_high: np.ndarray,
     path: str,
     scale: ScaleInfo,
     step: int,
 ):
-    """Interactive orbitable Plotly surface."""
-    d = depth01[::step, ::step]
-    h, w = d.shape
+    d = depth01_close_high[::step, ::step]
+    hh, ww = d.shape
 
-    x = (np.arange(w) * step) * scale.xy_scale
-    y = (np.arange(h) * step) * scale.xy_scale
+    x_mm = (np.arange(ww) * step) * scale.xy_scale_mm_per_px
+    y_mm = (np.arange(hh) * step) * scale.xy_scale_mm_per_px
+    z_mm = d * scale.z_span_mm
 
-    # Z is relative unless you customize z_scale
-    z = d * scale.z_scale
-
-    x_range = float(x[-1]) if len(x) > 1 else 1.0
-    y_range = float(y[-1]) if len(y) > 1 else 1.0
+    x_range = float(x_mm[-1]) if len(x_mm) > 1 else 1.0
+    y_range = float(y_mm[-1]) if len(y_mm) > 1 else 1.0
     xy_max = max(x_range, y_range)
-    z_ratio = (0.35 * xy_max / xy_max) if xy_max > 0 else 0.35
 
     fig = go.Figure(
         data=[
             go.Surface(
-                z=z,
-                x=x,
-                y=y,
+                z=z_mm,
+                x=x_mm,
+                y=y_mm,
                 colorscale="Viridis",
+                colorbar=dict(title="Relative depth mapped (mm)"),
                 lighting=dict(ambient=0.6, diffuse=0.8, specular=0.3),
                 contours=dict(
                     z=dict(
@@ -252,22 +216,21 @@ def save_surface_3d_html(
                         width=2,
                     )
                 ),
-                colorbar=dict(title=f"Depth ({'relative' if scale.z_scale == 1.0 else scale.units})"),
             )
         ]
     )
 
     fig.update_layout(
-        title="Depth Anything V2 - Interactive 3D Surface (orbit with mouse)",
+        title="Depth Anything V2 (non-metric) - Interactive 3D Surface (mm units)",
         scene=dict(
-            xaxis_title=f"X ({scale.units})",
-            yaxis_title=f"Y ({scale.units})",
-            zaxis_title=f"Depth ({'relative' if scale.z_scale == 1.0 else scale.units})",
+            xaxis_title="X (mm)",
+            yaxis_title="Y (mm)",
+            zaxis_title="Z (mm) [relative depth mapped]",
             aspectmode="manual",
             aspectratio=dict(
                 x=(x_range / xy_max) if xy_max > 0 else 1,
                 y=(y_range / xy_max) if xy_max > 0 else 1,
-                z=z_ratio,
+                z=0.35,
             ),
         ),
         margin=dict(l=0, r=0, t=40, b=0),
@@ -292,51 +255,44 @@ def run():
     h, w = rgb.shape[:2]
     print(f"Loaded image: {w} x {h} px")
 
-    scale = make_scale_info(w, h)
-    if DIST_MM is None:
-        print("DIST_MM not set -> XY units remain in pixels (no physical scaling).")
-    else:
-        diag_px = math.sqrt(w * w + h * h)
-        target_diag_mm = DIST_MM * 2.0 * math.tan(math.radians(FOV_DIAGONAL_DEG / 2.0))
-        print(
-            f"XY scaling enabled:\n"
-            f"  FOV diag: {FOV_DIAGONAL_DEG} deg\n"
-            f"  Dist    : {DIST_MM} mm\n"
-            f"  diag_px : {diag_px:.2f} px\n"
-            f"  diag_mm : {target_diag_mm:.2f} mm\n"
-            f"  scale   : {scale.xy_scale:.6f} mm/px"
-        )
+    scale = compute_scale_info(w, h)
 
-    print("Loading Depth Anything model ...")
-    model = load_model(DA_PATH, ENCODER, INDOOR_MODE)
+    diag_px = math.sqrt(w * w + h * h)
+    target_diag_mm = DIST_MM * 2.0 * math.tan(math.radians(FOV_DIAGONAL_DEG / 2.0))
+    print(
+        "Scaling (all outputs in mm):\n"
+        f"  FOV diag         : {FOV_DIAGONAL_DEG} deg\n"
+        f"  DIST_MM          : {DIST_MM} mm\n"
+        f"  TARGET_DIAG_MM   : {target_diag_mm:.2f} mm\n"
+        f"  diag_px          : {diag_px:.2f} px\n"
+        f"  XY scale         : {scale.xy_scale_mm_per_px:.6f} mm/px\n"
+        f"  Z_SPAN_MM        : {scale.z_span_mm:.2f} mm (relative depth mapped)"
+    )
+
+    print("Loading Depth Anything V2 model (non-metric) ...")
+    model = load_model_non_metric(DA_PATH, ENCODER)
 
     print("Running inference ...")
     raw_depth = model.infer_image(bgr)
 
-    # Normalize to [0,1]
-    d01 = normalize_depth(raw_depth, invert=INVERT_DEPTH)
+    d01 = normalize_depth_01(raw_depth, invert=INVERT_DEPTH)
 
-    # Convention: we want "close = high" for nicer surfaces/point clouds.
-    # If d01 is close=0 far=1, flipping gives close=1 far=0.
-    depth_display = float(np.max(d01)) - d01
+    # We want close = high (better relief). Flip normalized map.
+    depth01_close_high = float(np.max(d01)) - d01
 
-    # ---- Build + downsample PLY ----
     print("Building point cloud ...")
-    pcd = build_point_cloud(depth_display, rgb=rgb, scale=scale, step=PLY_STEP)
+    pcd = build_point_cloud_mm(depth01_close_high, rgb=rgb, scale=scale, step=PLY_STEP)
 
     if VOXEL_DOWNSAMPLE_MM is not None:
-        if DIST_MM is None:
-            raise ValueError("VOXEL_DOWNSAMPLE_MM requires DIST_MM so units are mm.")
         print(f"Voxel downsample: {VOXEL_DOWNSAMPLE_MM} mm")
         pcd = pcd.voxel_down_sample(float(VOXEL_DOWNSAMPLE_MM))
 
     ply_path = os.path.join(OUTPUT_DIR, PLY_FILENAME)
     o3d.io.write_point_cloud(ply_path, pcd, write_ascii=False, compressed=False)
-    print(f"Saved PLY: {ply_path} (points={np.asarray(pcd.points).shape[0]:,})")
+    print(f"Saved PLY:  {ply_path}  (points={np.asarray(pcd.points).shape[0]:,})")
 
-    # ---- HTML surface ----
     html_path = os.path.join(OUTPUT_DIR, HTML_FILENAME)
-    save_surface_3d_html(depth_display, html_path, scale=scale, step=HTML_STEP)
+    save_surface_3d_html_mm(depth01_close_high, html_path, scale=scale, step=HTML_STEP)
     print(f"Saved HTML: {html_path}")
 
 
