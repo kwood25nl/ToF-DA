@@ -1,22 +1,7 @@
 """
 Depth Anything V2 — Full Pipeline
 ==================================
-Outputs (in a timestamped subfolder of SAVE_ROOT):
-  - Depth_Map_Heatmap.png
-  - Depth_Map_Contour.png
-  - Depth_Map_Contour_3D.html   <- interactive, orbiteable in any browser
-  - Object_Mesh.ply             (coloured, for visualisation)
-  - Object_Solid.stl            (solid, 3-D printable; base + depth relief,
-                                  footprint = crop shape, smoothed edge taper)
-  - crop_region.json            (saved crop path for this run)
-  - crop_region_saved.json      (persistent across runs, in SAVE_ROOT)
-  - crop_description.txt        (mathematical description for reports)
 
-Crop tool (interactive matplotlib popup — mode chosen in terminal):
-  - rectangle : click-drag
-  - circle    : click centre, drag to set radius
-  - spline    : left-click to add control points, right-click or Enter to close & fit
-  Press 'r' to reset, Enter or close window to confirm.
 """
 
 import cv2
@@ -54,8 +39,9 @@ INVERT_DEPTH = False     # True -> closer = brighter in heatmap/PLY
 FOV_DIAGONAL_DEG = 70.42   # degrees  — diagonal field of view
 MAX_Z_MM     = 150        # mm  — scene depth & tallest point of the relief
 
-
-target_faces = 10000    # Number of Faces model will be simplified to
+# will use later for real-time like situations
+# DOWNSAMPLE_FACTOR = 4   # 1 = no downsample, 2 = half-res, 4 = quarter-res...
+TARGET_FACES = 100000
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -278,16 +264,64 @@ def run():
     model = load_model()
     print("Running inference ...")
     raw_depth = model.infer_image(bgr_frame)
-    depth     = renorm_depth(raw_depth, invert=INVERT_DEPTH)    # depth is now normalised to [0, 1]; with INVERT_DEPTH=False, close=0, far=1.
-    depth_display = np.max(depth) - depth
+    depth = renorm_depth(raw_depth, invert=INVERT_DEPTH)
 
+    # ---- Averaging downsample (most efficient place: immediately after inference) ----
+    # if int(DOWNSAMPLE_FACTOR) > 1:
+    #     # target shape
+    #     newW = full_W // k
+    #     newH = full_H // k
+    #
+    #     # AREA = averaging-like downsample, efficient (native)
+    #     depth = cv2.resize(depth, (newW, newH), interpolation=cv2.INTER_AREA)
+    #     rgb_frame = cv2.resize(rgb_frame, (newW, newH), interpolation=cv2.INTER_AREA)
+    #
+    #     # update physical scale so mm units still match FOV geometry
+    #     pixel_size_mm = pixel_size_mm * (full_W / newW)  # == pixel_size_mm*k when divisible
+    #     print(f"  Downsampled       : {full_W}x{full_H} -> {newW}x{newH} "
+    #           f"(AREA avg), new pixel size {pixel_size_mm:.4f} mm/px")
+
+
+    # Now continue using the downsampled depth/rgb
+    depth_display = np.max(depth) - depth
 
     print("\nBuilding PLY mesh ...")
     ply_depth = np.flipud(depth_display)
     ply_rgb   = np.flipud(rgb_frame)
     ply_mesh  = build_ply_mesh(ply_depth, rgb_image=ply_rgb, dz=MAX_Z_MM, xy_scale=pixel_size_mm)
+# temporary mesh repair (not real time --------------
+    ms = pymeshlab.MeshSet()
+    ms.add_mesh(
+        pymeshlab.Mesh(
+            vertex_matrix=np.asarray(ply_mesh.vertices),
+            face_matrix=np.asarray(ply_mesh.triangles)
+        )
+    )
+
+    faces_before = ms.current_mesh().face_number()
+    print(f"  Faces before: {faces_before:,}")
+
+    print(f"  Simplifying to ~{TARGET_FACES:,} faces …")
+    ms.meshing_decimation_quadric_edge_collapse(
+        targetfacenum=TARGET_FACES,
+        qualitythr=0.3,
+        preserveboundary=True,
+        preservenormal=True,
+        optimalplacement=True,
+        planarquadric=False,
+    )
+
+    ms.meshing_remove_duplicate_faces()
+    ms.meshing_remove_duplicate_vertices()
+    ms.meshing_remove_null_faces()
+    ms.meshing_repair_non_manifold_edges(method=0)
+    ms.meshing_repair_non_manifold_vertices()
+    ms.meshing_close_holes(maxholesize=30)
+    # --------------------
+
     ply_path  = os.path.join(save_folder, "Object_Mesh.ply")
-    o3d.io.write_triangle_mesh(ply_path, ply_mesh)
+    # o3d.io.write_triangle_mesh(ply_path, ply_mesh) # for real time
+    ms.save_current_mesh(os.path.join(save_folder, "Object_Mesh.ply")) # not for realtime
     print(f"  Saved PLY mesh    -> {ply_path}")
 
 
