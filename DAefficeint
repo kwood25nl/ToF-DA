@@ -1,297 +1,301 @@
-"""Standalone Depth Anything V2 (non-metric) -> scaled point cloud (.ply) + interactive 3D surface (.html)
+"""
+Depth Anything V2 — Full Pipeline
+==================================
+Outputs (in a timestamped subfolder of SAVE_ROOT):
+  - Depth_Map_Heatmap.png
+  - Depth_Map_Contour.png
+  - Depth_Map_Contour_3D.html   <- interactive, orbiteable in any browser
+  - Object_Mesh.ply             (coloured, for visualisation)
+  - Object_Solid.stl            (solid, 3-D printable; base + depth relief,
+                                  footprint = crop shape, smoothed edge taper)
+  - crop_region.json            (saved crop path for this run)
+  - crop_region_saved.json      (persistent across runs, in SAVE_ROOT)
+  - crop_description.txt        (mathematical description for reports)
 
-Outputs (written to OUTPUT_DIR)
-------------------------------
-- PointCloud.ply   (Open3D point cloud)
-- Surface_3D.html  (interactive orbitable Plotly surface)
-
-Scaling (what this script does)
--------------------------------
-Depth Anything V2 (non-metric) gives relative depth. This script:
-
-1) Runs Depth Anything on the image.
-2) Builds an initial point cloud in *pixel units* (x,y in pixels; z in [0..1]).
-3) Computes a single uniform scale factor s (mm per pixel) so that the XY
-   diagonal matches the camera FOV diagonal footprint at DIST_MM:
-
-    TARGET_DIAGONAL_MM = DIST_MM * 2 * tan(FOV_DIAGONAL_DEG/2)
-    diag_px            = sqrt(W^2 + H^2)
-    s                  = TARGET_DIAGONAL_MM / diag_px
-
-4) Scales the entire point cloud proportionally by s (X,Y,Z all multiplied by s).
-
-Orientation (inspired by exampleDA.py)
---------------------------------------
-In your exampleDA.py, the Open3D export is corrected with:
-
-  ply_depth = np.flipud(depth)
-  ply_rgb   = np.flipud(rgb)
-
-We do the same:
-- We do NOT flip the image before inference.
-- We flip the depth map *after* it is computed, and we flip rgb only for
-  coloring the point cloud.
-
-Downsampling
-------------
-- PLY_STEP: take every Nth pixel before creating the PLY point cloud.
-- VOXEL_DOWNSAMPLE_MM: optional Open3D voxel downsample in mm.
-- HTML_STEP: take every Nth pixel for the Plotly surface.
-
-Edit these paths
-----------------
-Set IMAGE_PATH, OUTPUT_DIR, and DA_PATH below.
+Crop tool (interactive matplotlib popup — mode chosen in terminal):
+  - rectangle : click-drag
+  - circle    : click centre, drag to set radius
+  - spline    : left-click to add control points, right-click or Enter to close & fit
+  Press 'r' to reset, Enter or close window to confirm.
 """
 
-from __future__ import annotations
-
+import cv2
 import os
 import sys
-import math
+from datetime import datetime
 
-import cv2
+import matplotlib
+matplotlib.use("TkAgg")          # change to "Qt5Agg" if TkAgg is unavailable
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+
 import numpy as np
 import open3d as o3d
 import plotly.graph_objects as go
 import torch
+import pymeshlab
+
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+IMAGE_PATH   = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-00002\sc139_shifted.jpg"
+SAVE_ROOT    = os.path.join(r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-000042\DA tests", "Output")
+
+DA_PATH      = r"Z:\Cas\Diepte_Herkenning\AIMODELS\Depth-Anything-V2"
+
+ENCODER      = "vitl"    # "vits" | "vitb" | "vitl"
+INDOOR_MODE  = False     # True = metric metres, False = relative depth
+INVERT_DEPTH = False     # True -> closer = brighter in heatmap/PLY
+
+# Physical scale — computed from the full image BEFORE any crop is applied.
+# FOV_DIAGONAL_DEG : diagonal field of view of the camera/sensor in degrees.
+# MAX_Z_MM         : maximum depth of the scene in mm (also used as the working
+#                    distance for the FOV geometry, so it determines how many mm
+#                    each pixel represents in x/y as well as the z relief scale).
+# Together: pixel_size_mm = 2*MAX_Z_MM*tan(FOV/2) / sqrt(W^2+H^2)
+FOV_DIAGONAL_DEG = 70.42   # degrees  — diagonal field of view
+MAX_Z_MM     = 150        # mm  — scene depth & tallest point of the relief
 
 
-# =============================================================================
-# EDIT THESE PATHS
-# =============================================================================
-IMAGE_PATH = r""  # e.g. r"Z:\\path\\to\\image.jpg"
-OUTPUT_DIR = r""  # e.g. r"Z:\\path\\to\\output_folder"
-
-# Depth-Anything-V2 folder (must contain depth_anything_v2/ and checkpoints/)
-DA_PATH = r"Z:\Cas\Diepte_Herkenning\AIMODELS\Depth-Anything-V2"
-# =============================================================================
+target_faces = 10000    # Number of Faces model will be simplified to
+# ─────────────────────────────────────────────────────────────────────────────
 
 
-# =============================================================================
-# USER INPUTS (edit here)
-# =============================================================================
-FOV_DIAGONAL_DEG = 71.0
-DIST_MM = 150.0
+# ══════════════════════════════════════════════════════════════════════════════
+#  COLOUR NORMALISATION
+# ══════════════════════════════════════════════════════════════════════════════
+class ReciprocalNorm(mcolors.Normalize):
+    """1/z^alpha colour normalisation — close = bright, far = dark."""
 
-ENCODER = "vitl"  # "vits" | "vitb" | "vitl"
-INVERT_DEPTH = False  # True -> invert raw depth before normalizing
+    def __init__(self, vmin, vmax, alpha=1.0, clip=False):
+        super().__init__(vmin, vmax, clip)
+        self.alpha  = alpha
+        self.r_vmin = 1.0 / (vmax ** alpha)
+        self.r_vmax = 1.0 / (vmin ** alpha)
 
-# Downsampling
-PLY_STEP = 2
-HTML_STEP = 6
-VOXEL_DOWNSAMPLE_MM: float | None = 1.0
+    def __call__(self, value, clip=None):
+        value = np.array(value, dtype=float)
+        value = np.where(value <= 0, np.nan, value)
+        inv   = 1.0 / (value ** self.alpha)
+        res   = (self.r_vmax - inv) / (self.r_vmax - self.r_vmin)
+        return np.ma.masked_invalid(res)
 
-# Output filenames
-PLY_FILENAME = "PointCloud.ply"
-HTML_FILENAME = "Surface_3D.html"
-# =============================================================================
+    def inverse(self, value):
+        inv = self.r_vmax - value * (self.r_vmax - self.r_vmin)
+        return (1.0 / inv) ** (1.0 / self.alpha)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PHYSICAL SCALE
+# ══════════════════════════════════════════════════════════════════════════════
+def compute_pixel_size_mm(W: int, H: int,
+                          fov_diagonal_deg: float,
+                          max_z_mm: float) -> float:
+    """
+    Return the physical size of one pixel in mm.
+
+    MAX_Z_MM is treated as both the scene depth and the working distance for
+    the FOV geometry.  At that distance the diagonal FOV covers:
+        physical_diagonal_mm = 2 * max_z_mm * tan(fov_diagonal_deg / 2)
+    spread across sqrt(W^2 + H^2) pixels, giving:
+        pixel_size_mm = physical_diagonal_mm / sqrt(W^2 + H^2)
+
+    This is always computed from the FULL image dimensions so that the
+    physical scale is consistent regardless of which crop is applied later.
+    """
+    import math
+    half_angle_rad    = math.radians(fov_diagonal_deg / 2.0)
+    phys_diagonal_mm  = 2.0 * max_z_mm * math.tan(half_angle_rad)
+    pixel_diagonal_px = math.sqrt(W ** 2 + H ** 2)
+    return phys_diagonal_mm / pixel_diagonal_px
 
 
-def _device() -> str:
-    return (
+# ══════════════════════════════════════════════════════════════════════════════
+#  MODEL
+# ══════════════════════════════════════════════════════════════════════════════
+def load_model():
+    if DA_PATH not in sys.path:
+        sys.path.insert(0, DA_PATH)
+
+    model_configs = {
+        "vits": {"encoder": "vits", "features": 64,  "out_channels": [48,  96,  192,  384]},
+        "vitb": {"encoder": "vitb", "features": 128, "out_channels": [96,  192, 384,  768]},
+        "vitl": {"encoder": "vitl", "features": 256, "out_channels": [256, 512, 1024, 1024]},
+    }
+
+    device = (
         "cuda" if torch.cuda.is_available()
         else "mps" if torch.backends.mps.is_available()
         else "cpu"
     )
+    print(f"  Device: {device}")
 
-
-def load_model_non_metric(da_path: str, encoder: str):
-    """Load Depth Anything V2 non-metric model from a local clone at da_path."""
-    if da_path not in sys.path:
-        sys.path.insert(0, da_path)
-
-    model_configs = {
-        "vits": {"encoder": "vits", "features": 64, "out_channels": [48, 96, 192, 384]},
-        "vitb": {"encoder": "vitb", "features": 128, "out_channels": [96, 192, 384, 768]},
-        "vitl": {"encoder": "vitl", "features": 256, "out_channels": [256, 512, 1024, 1024]},
-    }
-
-    dev = _device()
-    print(f"Device: {dev}")
-
-    from depth_anything_v2.dpt import DepthAnythingV2
-
-    cfg = model_configs[encoder]
-    ckpt = os.path.join(da_path, f"checkpoints/depth_anything_v2_{encoder}.pth")
-    if not os.path.exists(ckpt):
-        raise FileNotFoundError(
-            f"Checkpoint not found: {ckpt}\n"
-            f"Check DA_PATH and ENCODER settings."
-        )
+    if INDOOR_MODE:
+        from metric_depth.depth_anything_v2.dpt import DepthAnythingV2
+        cfg  = {**model_configs[ENCODER], "max_depth": 10}
+        ckpt = os.path.join(DA_PATH,
+               f"checkpoints/depth_anything_v2_metric_hypersim_{ENCODER}.pth")
+    else:
+        from depth_anything_v2.dpt import DepthAnythingV2
+        cfg  = model_configs[ENCODER]
+        ckpt = os.path.join(DA_PATH,
+               f"checkpoints/depth_anything_v2_{ENCODER}.pth")
 
     model = DepthAnythingV2(**cfg)
     model.load_state_dict(torch.load(ckpt, map_location="cpu"))
-    return model.to(dev).eval()
+    return model.to(device).eval()
 
 
-def normalize_depth_01(depth: np.ndarray, invert: bool) -> np.ndarray:
-    """Normalize depth to [0,1]."""
-    d = depth.astype(np.float32)
+def renorm_depth(depth: np.ndarray, invert: bool = True) -> np.ndarray:
     if invert:
-        d = 1.0 / (d + 1e-8)
-    d = cv2.normalize(d, None, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
-    return d
+        depth = 1.0 / (depth + 1e-8)
+    depth = cv2.normalize(depth, None, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
+    if not invert:
+        depth = 1.0 - depth
+    return depth
 
 
-def compute_uniform_scale_mm_per_px(w: int, h: int) -> tuple[float, float, float]:
-    """Return (s_mm_per_px, diag_px, target_diag_mm)."""
-    diag_px = math.sqrt(w * w + h * h)
-    target_diag_mm = DIST_MM * 2.0 * math.tan(math.radians(FOV_DIAGONAL_DEG / 2.0))
-    s = target_diag_mm / diag_px
-    return s, diag_px, target_diag_mm
+# ══════════════════════════════════════════════════════════════════════════════
+#  PLY MESH  (coloured, for visualisation)
+# ══════════════════════════════════════════════════════════════════════════════
+def build_ply_mesh(depth_map: np.ndarray,
+                   rgb_image: np.ndarray | None = None,
+                   cmap_name: str = "gray",
+                   dz: float = 1.0,
+                   xy_scale: float = 1.0) -> o3d.geometry.TriangleMesh:
+    H, W     = depth_map.shape
+    scaled   = depth_map * dz
 
+    jj, ii   = np.meshgrid(np.arange(W), np.arange(H))
+    vertices = np.column_stack([jj.ravel().astype(float) * xy_scale,
+                                ii.ravel().astype(float) * xy_scale,
+                                scaled.ravel().astype(float)])
 
-def build_point_cloud_uniform_mm(
-    depth01_close_high: np.ndarray,
-    rgb_for_color: np.ndarray | None,
-    s_mm_per_px: float,
-    step: int,
-) -> o3d.geometry.PointCloud:
-    if step < 1:
-        raise ValueError("PLY_STEP must be >= 1")
+    if rgb_image is not None:
+        colours = rgb_image.reshape(-1, 3) / 255.0
+    else:
+        cmap    = plt.get_cmap(cmap_name)
+        inv     = 1.0 / (depth_map + 1e-8)
+        norm    = ReciprocalNorm(vmin=inv.min(), vmax=inv.max(), alpha=1.0)
+        colours = np.array([cmap(float(v))[:3] for v in norm(inv).ravel()])
 
-    d = depth01_close_high[::step, ::step]
-    hh, ww = d.shape
+    idx  = np.arange(H * W).reshape(H, W)
+    v0   = idx[:-1, :-1].ravel();  v1 = idx[:-1, 1:].ravel()
+    v2   = idx[1:,  :-1].ravel();  v3 = idx[1:,  1:].ravel()
+    tris = np.concatenate([np.column_stack([v0, v1, v2]),
+                           np.column_stack([v1, v3, v2])], axis=0)
 
-    jj, ii = np.meshgrid(np.arange(ww), np.arange(hh))
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices      = o3d.utility.Vector3dVector(vertices)
+    mesh.triangles     = o3d.utility.Vector3iVector(tris)
+    mesh.vertex_colors = o3d.utility.Vector3dVector(colours)
+    mesh.compute_vertex_normals()
+    return mesh
 
-    # Pixel coordinates (in full-res pixel units) -> mm
-    x_mm = (jj.astype(np.float32) * step) * s_mm_per_px
-    y_mm = (ii.astype(np.float32) * step) * s_mm_per_px
+# ══════════════════════════════════════════════════════════════════════════════
+#  PLOTS
+# ══════════════════════════════════════════════════════════════════════════════
+def save_contour_3d_html(depth: np.ndarray, path: str, step: int = 4,
+                         dz: float = 1.0, xy_scale: float = 1.0):
+    """
+    Export an interactive, orbiteable 3-D surface plot with contour lines as a
+    self-contained HTML file using Plotly.  Contour lines are drawn directly on
+    the surface so the plot acts as both a depth surface and a contour map.
+    'step' downsamples the depth map so the file stays manageable
+    (step=4 -> uses every 4th pixel in x and y).
+    x/y axes are in mm (xy_scale mm per pixel); z axis is in mm (dz applied).
+    """
+    d = depth[::step, ::step] * dz
+    H, W = d.shape
+    x = np.arange(W) * step * xy_scale
+    y = np.arange(H) * step * xy_scale
 
-    # Relative depth [0..1] -> mm by same uniform scale
-    z_mm = d.astype(np.float32) * s_mm_per_px
+    x_range_mm = x[-1] if len(x) > 1 else 1.0
+    y_range_mm = y[-1] if len(y) > 1 else 1.0
+    xy_max     = max(x_range_mm, y_range_mm)
+    z_ratio    = (dz / xy_max) if xy_max > 0 else 0.4
 
-    pts = np.stack([x_mm, y_mm, z_mm], axis=-1).reshape(-1, 3)
-
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
-
-    if rgb_for_color is not None:
-        rgb_s = rgb_for_color[::step, ::step].reshape(-1, 3).astype(np.float32) / 255.0
-        pcd.colors = o3d.utility.Vector3dVector(rgb_s.astype(np.float64))
-
-    return pcd
-
-
-def save_surface_3d_html_uniform_mm(
-    depth01_close_high: np.ndarray,
-    path: str,
-    s_mm_per_px: float,
-    step: int,
-):
-    if step < 1:
-        raise ValueError("HTML_STEP must be >= 1")
-
-    d = depth01_close_high[::step, ::step]
-    hh, ww = d.shape
-
-    x_mm = (np.arange(ww) * step) * s_mm_per_px
-    y_mm = (np.arange(hh) * step) * s_mm_per_px
-    z_mm = d * s_mm_per_px
-
-    x_range = float(x_mm[-1]) if len(x_mm) > 1 else 1.0
-    y_range = float(y_mm[-1]) if len(y_mm) > 1 else 1.0
-    xy_max = max(x_range, y_range)
-
-    fig = go.Figure(
-        data=[
-            go.Surface(
-                z=z_mm,
-                x=x_mm,
-                y=y_mm,
-                colorscale="Viridis",
-                colorbar=dict(title="Relative depth (scaled to mm)"),
-                lighting=dict(ambient=0.6, diffuse=0.8, specular=0.3),
-                contours=dict(
-                    z=dict(
-                        show=True,
-                        usecolormap=True,
-                        highlightcolor="white",
-                        project_z=False,
-                        width=2,
-                    )
-                ),
+    fig = go.Figure(data=[go.Surface(
+        z=d,
+        x=x,
+        y=y,
+        colorscale="Viridis",
+        colorbar=dict(title="Depth (mm)"),
+        lighting=dict(ambient=0.6, diffuse=0.8, specular=0.3),
+        contours=dict(
+            z=dict(
+                show=True,
+                usecolormap=True,
+                highlightcolor="white",
+                project_z=False,
+                width=2,
             )
-        ]
-    )
+        ),
+    )])
 
     fig.update_layout(
-        title="Depth Anything V2 (non-metric) - Interactive 3D Surface (uniform mm scaling)",
+        title="Depth Map - Interactive 3D Contour Surface (orbit with mouse)",
         scene=dict(
             xaxis_title="X (mm)",
             yaxis_title="Y (mm)",
-            zaxis_title="Z (mm) [relative scaled]",
+            zaxis_title="Depth (mm)",
             aspectmode="manual",
-            aspectratio=dict(
-                x=(x_range / xy_max) if xy_max > 0 else 1,
-                y=(y_range / xy_max) if xy_max > 0 else 1,
-                z=0.35,
-            ),
+            aspectratio=dict(x=x_range_mm / xy_max, y=y_range_mm / xy_max,
+                             z=z_ratio),
         ),
         margin=dict(l=0, r=0, t=40, b=0),
     )
 
     fig.write_html(path, include_plotlyjs="cdn", full_html=True)
+    print(f"  Saved 3D HTML     -> {path}")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════════════════
 def run():
-    if not IMAGE_PATH:
-        raise ValueError("Set IMAGE_PATH at the top of the script.")
-    if not OUTPUT_DIR:
-        raise ValueError("Set OUTPUT_DIR at the top of the script.")
+    timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    save_folder = os.path.join(SAVE_ROOT, timestamp)
+    os.makedirs(save_folder, exist_ok=True)
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    print(f"\nOutput folder: {save_folder}\n")
 
-    bgr = cv2.imread(IMAGE_PATH)
-    if bgr is None:
-        raise FileNotFoundError(f"Could not read image: {IMAGE_PATH}")
+    # ── Load image ────────────────────────────────────────────────────────────
+    bgr_frame = cv2.imread(IMAGE_PATH)
+    rgb_frame = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
+    print(f"Image loaded: {rgb_frame.shape[1]} x {rgb_frame.shape[0]} px")
 
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    h, w = rgb.shape[:2]
-    print(f"Loaded image: {w} x {h} px")
+    # Compute physical pixel size from the FULL image before any crop is applied.
+    # MAX_Z_MM is used as the working distance: at that depth the scene diagonal
+    # spans  2*MAX_Z_MM*tan(FOV/2) mm, which sets the mm/pixel ratio.
+    full_H, full_W = rgb_frame.shape[:2]
+    pixel_size_mm  = compute_pixel_size_mm(full_W, full_H,
+                                           FOV_DIAGONAL_DEG, MAX_Z_MM)
+    print(f"  Pixel size        : {pixel_size_mm:.4f} mm/px  "
+          f"(FOV {FOV_DIAGONAL_DEG}° diag, max-z {MAX_Z_MM} mm  →  "
+          f"{full_W * pixel_size_mm:.1f} x {full_H * pixel_size_mm:.1f} mm scene)")
 
-    print("Loading Depth Anything V2 model (non-metric) ...")
-    model = load_model_non_metric(DA_PATH, ENCODER)
 
+    # ── Inference ─────────────────────────────────────────────────────────────
+    print("\nLoading model ...")
+    model = load_model()
     print("Running inference ...")
-    raw_depth = model.infer_image(bgr)
+    raw_depth = model.infer_image(bgr_frame)
+    depth     = renorm_depth(raw_depth, invert=INVERT_DEPTH)    # depth is now normalised to [0, 1]; with INVERT_DEPTH=False, close=0, far=1.
+    depth_display = np.max(depth) - depth
 
-    d01 = normalize_depth_01(raw_depth, invert=INVERT_DEPTH)
 
-    # We want close = high (better relief). Flip normalized map.
-    depth01_close_high = float(np.max(d01)) - d01
+    print("\nBuilding PLY mesh ...")
+    ply_depth = np.flipud(depth_display)
+    ply_rgb   = np.flipud(rgb_frame)
+    ply_mesh  = build_ply_mesh(ply_depth, rgb_image=ply_rgb, dz=MAX_Z_MM, xy_scale=pixel_size_mm)
+    ply_path  = os.path.join(save_folder, "Object_Mesh.ply")
+    o3d.io.write_triangle_mesh(ply_path, ply_mesh)
+    print(f"  Saved PLY mesh    -> {ply_path}")
 
-    # Orientation fix (match exampleDA.py PLY export): flip vertically for geometry & colors
-    depth01_close_high = np.flipud(depth01_close_high)
-    rgb_for_color = np.flipud(rgb)
 
-    # Uniform scale factor based on FOV+distance
-    s, diag_px, target_diag_mm = compute_uniform_scale_mm_per_px(w, h)
+    save_contour_3d_html(depth_display,
+                         os.path.join(save_folder, "Depth_Map_Contour_3D.html"),
+                         dz=MAX_Z_MM, xy_scale=pixel_size_mm)
 
-    print(
-        "Uniform scaling (mm):\n"
-        f"  FOV diag         : {FOV_DIAGONAL_DEG} deg\n"
-        f"  DIST_MM          : {DIST_MM} mm\n"
-        f"  TARGET_DIAG_MM   : {target_diag_mm:.2f} mm\n"
-        f"  diag_px          : {diag_px:.2f} px\n"
-        f"  scale s          : {s:.6f} mm/px (applied to X,Y,Z)"
-    )
-
-    print("Building point cloud ...")
-    pcd = build_point_cloud_uniform_mm(depth01_close_high, rgb_for_color=rgb_for_color, s_mm_per_px=s, step=PLY_STEP)
-
-    if VOXEL_DOWNSAMPLE_MM is not None:
-        print(f"Voxel downsample: {VOXEL_DOWNSAMPLE_MM} mm")
-        pcd = pcd.voxel_down_sample(float(VOXEL_DOWNSAMPLE_MM))
-
-    ply_path = os.path.join(OUTPUT_DIR, PLY_FILENAME)
-    o3d.io.write_point_cloud(ply_path, pcd, write_ascii=False, compressed=False)
-    print(f"Saved PLY:  {ply_path}  (points={np.asarray(pcd.points).shape[0]:,})")
-
-    html_path = os.path.join(OUTPUT_DIR, HTML_FILENAME)
-    save_surface_3d_html_uniform_mm(depth01_close_high, html_path, s_mm_per_px=s, step=HTML_STEP)
-    print(f"Saved HTML: {html_path}")
+    print(f"\nAll done! Files saved to:\n  {save_folder}")
 
 
 if __name__ == "__main__":
